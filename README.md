@@ -30,10 +30,18 @@ Designed to simplify everyday tasks, JARVIS provides a foundation for building a
 
 Update this section according to the technologies actually used in the project.
 
-- **Programming Language:** [Your Language]
-- **AI / LLM:** [Your AI Model or API]
-- **Framework:** [Your Framework]
-- **Development Environment:** [Your IDE]
+- **Programming Language:** Python
+- **AI / LLM:** Google Gemini API (google-genai)
+- **Framework:** LangChain, LangGraph
+- **Environment Management:** Python Dotenv
+- **Messaging Integration:** Telegram Bot API
+- **Media & File Processing:** Pillow, filetype, yt-dlp
+- **Backend / API:** FastAPI
+- **Server:** Uvicorn
+- **Database:** SQLite, aiosqlite, LangGraph SQLite Checkpoint
+- **Automation & Scheduling:** APScheduler, AsyncIO
+- **Data Validation:** Pydantic
+- **HTTP & API Requests:** HTTPX, Requests
 
 ## 📁 Project Structure
 
