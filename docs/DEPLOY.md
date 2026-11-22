@@ -1,0 +1,326 @@
+# Deploy & operations runbook
+
+How to run the operator tooling for the two Jarvis instances. Design rationale lives
+in [plans/archive/STAGING_AND_DEPLOY.md](plans/archive/STAGING_AND_DEPLOY.md); this is the how‑to.
+
+## The two instances
+
+| | Prod | Staging |
+|---|---|---|
+| Root (`JARVIS_ROOT`) | `/app` | `/app/jarvis_staging` |
+| Code | `/app/jarvis_code` | `/app/jarvis_staging/code` |
+| Service | `jarvis.service` | `jarvis-staging.service` (started on demand, not enabled) |
+| Proactive (heartbeat/reminders/webhook) | on | off (inert) |
+| Bot | the real Jarvis | the staging test bot |
+
+Every state path derives from `JARVIS_ROOT` (`config.py`); an unset root refuses to
+start. **Code flows through GitHub:** develop in the staging tree → push → merge to
+`origin/main` → prod pulls with `deploy.sh`. The owner runs every restart.
+
+> Restarts and unit installs need root, done from the Proxmox host via `pct exec 106 -- …`
+> or `pct enter 106`. Claude/CI cannot restart the service.
+
+---
+
+## `deploy/deploy.sh` — update prod to `origin/main`
+
+Run **from the prod checkout**. Pulls `origin/main`, tags the new commit, verifies it
+imports, and hands off. **It never restarts** — you do that after it prints the hand‑off.
+
+```bash
+cd /app/jarvis_code
+./deploy/deploy.sh            # normal deploy
+./deploy/deploy.sh --force    # deploy past a rolled-back/detached HEAD (see rollback)
+```
+
+What it does, and why each step fails closed:
+
+1. **Refuses a detached/rolled‑back HEAD** without `--force` — otherwise its `checkout main` would silently undo a rollback.
+2. **Clean‑tree check** — won't fold uncommitted edits into the pull.
+3. **Snapshots state** (`backup_state.sh`) keyed to the tag‑to‑be, *before* the pull — so a format‑changing deploy is recoverable (rollback restores code, not data).
+4. **`checkout main` + `pull --ff-only origin main`** — fails on divergence.
+5. **Tags the incoming commit** `deploy-YYYY-MM-DD-N` and pushes it — this is what makes the startup block's `deploy :` row name the live deploy.
+6. **Dep sync** — `pip install` only if `requirements.txt` changed.
+7. **Import smoke check** — `JARVIS_ROOT=/app venv/bin/python -c "import main"`. The prefix is mandatory (config is fail‑closed).
+8. **Path‑isolation check** (`check_paths.py`) — no module hardcodes a prod path.
+9. **Unit assertion** — the installed `jarvis.service` still declares `JARVIS_ROOT` (a lost line would fail‑closed on the next boot, which the smoke check can't see).
+10. **Prunes old backups** (newest 10 plus the last 5 deploys' snapshots), then **prints the restart hand‑off**.
+
+Any failure aborts **before** the restart. After it succeeds:
+
+```bash
+pct exec 106 -- systemctl restart jarvis.service
+scripts/jrestart.sh      # or watch journalctl for the 'Running code:' block
+```
+
+---
+
+## `deploy/rollback.sh` — revert prod to a previous deploy
+
+Run **from the prod checkout**. Reverts **code** to a chosen `deploy-*` tag. **Never
+restarts** — you do that after.
+
+```bash
+deploy/rollback.sh                       # list recent deploy-* tags (newest first)
+deploy/rollback.sh deploy-2026-07-23-1 "webhook regression"   # roll back to that tag
+```
+
+1. **Lists** recent `deploy-*` tags (no arg), or takes a target tag + optional reason.
+2. Refuses a dirty tree; shows the commits being undone.
+3. **Checks out the tag — this detaches HEAD on purpose.** That detached state is what
+   `deploy/deploy.sh` step 0 refuses (without `--force`), so the next deploy can't
+   silently un‑roll‑back you. The startup block shows a loud `HEAD is DETACHED` row on
+   every boot until you deploy forward again.
+4. Writes **`.rollback-marker`** (what/why/when — audit).
+5. Restart to apply: `pct exec 106 -- systemctl restart jarvis.service`.
+
+**Code vs data.** Rollback reverts code only. If a deploy being undone changed a
+persisted format, mark its commit message with **`[format-change]`** — then `rollback.sh`
+prints a **loud instruction** naming the pre‑change state tarball to restore with
+`deploy/backup_state.sh --restore` *before* you restart. It won't restore data for you
+(that stops the service — your conscious call).
+
+**Getting back to `main`:** `deploy/deploy.sh --force` returns you to `main` and clears
+the marker; the `--force` is required precisely so leaving a rollback is deliberate.
+
+---
+
+## `deploy/backup_state.sh` — snapshot / restore / prune state
+
+Backs up the two state trees (`jarvis_memory` incl. the conversation DB, and
+`jarvis_data`). Rooted at `${JARVIS_ROOT:-/app}`. Covers everything Jarvis *owns* —
+not code (git), and not writes that already left the box (a real media add).
+
+```bash
+# snapshot -> $ROOT/backups/state-<label>-<UTC-ts>.tar.gz  (path printed on stdout)
+deploy/backup_state.sh pre-change
+JARVIS_ROOT=/app/jarvis_staging deploy/backup_state.sh staging-snap   # a different instance
+
+# restore: stops the service, moves current trees aside to *-superseded-<ts>
+# (never deletes), unpacks, hands off the restart
+deploy/backup_state.sh --restore /app/backups/state-pre-change-<ts>.tar.gz
+
+# prune: keep the newest N (default 10) plus the snapshots of the last 5 deploys
+deploy/backup_state.sh --prune
+deploy/backup_state.sh --prune --dry-run   # list what would go; delete nothing
+```
+
+Take a snapshot with the service **stopped** for a consistent DB; a live snapshot may
+catch the DB `-wal` mid‑write (fine for restore‑to‑a‑point). `deploy.sh` calls it
+automatically; run it by hand before any risky manual edit.
+
+**Two backups, two jobs.** These snapshots undo the last few deploys: `rollback.sh`
+auto-picks the matching snapshot for any of the last 5 deploys, and lists what is left
+when an older one has none. Losing the disk or the container is covered by the Proxmox
+container backup, not by these (they sit on the same disk). Anything kept outside the two
+state trees is never in these snapshots and is covered by the container backup alone.
+The file store's bytes (`$ROOT/jarvis_files/`) are such a case; its index is in the
+snapshot. After any `--restore`, run `JARVIS_ROOT=<root> venv/bin/python
+scripts/files_verify.py`: an older index can name files whose bytes were collected since
+(they show up as missing), and it doesn't know the files that arrived after its snapshot.
+Those bytes are kept (the store only removes bytes its index says were released) and show
+up as unknown.
+
+---
+
+## `scripts/check_env.sh` — `.env` key‑set drift
+
+Diffs which **keys** are present across `.env.example` and each instance's
+`secrets/.env`. Emits key **names only, never values**. Unset keys degrade silently
+(wrong defaults), so this catches drift before it bites — e.g. adding a key to prod's
+`.env` and forgetting staging's.
+
+```bash
+scripts/check_env.sh      # exit 1 if any instance is missing a template key
+```
+
+---
+
+## `scripts/ci/check_paths.py` — path‑isolation guard
+
+Imports the whole app under a throwaway root and fails if any module‑level constant
+still hardcodes `/app/jarvis_memory` or `/app/jarvis_data`. This is what keeps the
+`JARVIS_ROOT` isolation from silently regressing when a future edit adds a hardcoded
+path. Run by `deploy.sh`, the pre‑commit hook, and CI.
+
+```bash
+venv/bin/python scripts/ci/check_paths.py    # exit 0 clean, 1 on a leak
+```
+
+**The regression gate has three layers** (see the plan's "Regression gate (CI)"):
+
+- **Commit** — `.githooks/pre-commit` runs the check on every `git commit`. Active only
+  where `core.hooksPath` points at it, so enable it once per checkout:
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+  Fast local feedback; bypassable with `git commit --no-verify`.
+- **Merge** — `.github/workflows/ci.yml` runs the test suite and the guards on every PR and
+  push to `main`, as five independent jobs (`tests`, `path-isolation`, `channel-agnostic`,
+  `command-replies`, `timezone-anchors`), all five required under the **branch-protection rule** on `main`
+  (GitHub → Settings → Branches). This is the real gate. `enforce_admins` is deliberately
+  **off**: a red check warns the owner rather than hard-blocking, so an emergency merge stays
+  possible in a one-person repo.
+  The `tests` job runs the pytest suite in `tests/` (no network, no secrets — `tests/conftest.py`
+  sets a scratch root and a dummy key). It is not in the pre-commit hook: like
+  `command-replies` it boots the app. Run it locally with `venv/bin/python -m pytest`.
+- **Deploy** — `deploy/deploy.sh` runs the path check before the restart hand-off.
+
+## `scripts/ci/check_channel_agnostic.py` — channel-agnostic guard
+
+A pure static source scan (no app import) that keeps multi-channel support from regressing:
+domain code (and slash-command handlers) never import a concrete channel, nothing in
+`gateway/` reverse-imports the app (except `gateway/commands/`, the documented bridge), and no
+channel name leaks into `tools/` (tool docstrings are prompt content). Mirrors the Gateway
+G1/G2 items in the `code-review` skill.
+
+```bash
+venv/bin/python scripts/ci/check_channel_agnostic.py   # exit 0 clean, 1 on a leak
+```
+
+Runs at **commit** (pre-commit hook) and **merge** (its own `channel-agnostic` CI job) — the
+same first two layers as the path guard. It is **not** run at deploy: it is architecture
+hygiene, not runtime-state safety, and `main` has already passed it.
+
+## `scripts/ci/check_command_replies.py` — slash-command reply-layout guard
+
+Runs every registered slash command against a seeded scratch `JARVIS_ROOT` (same dummy-secret
+trick as the path guard — no real secrets, no network call) and checks each reply against the
+layout contract in [architecture/GATEWAY.md](architecture/GATEWAY.md) § Reply formatting: bold
+header, blank line, real `- ` list items, no literal `•`. Handler markdown crosses two
+renderers with different newline semantics, and the same collapse defect was fixed three times
+in isolation before this existed. A command registered without a case in `CASES` fails the
+guard, so a new command can't join without a decision about its layout.
+
+```bash
+venv/bin/python scripts/ci/check_command_replies.py   # exit 0 clean, 1 on a defect
+```
+
+**Merge** only — its own `command-replies` CI job. Not in the pre-commit hook (it boots
+the whole app to render each reply, ~1.5s, too slow for a commit-time guard) and not at
+deploy (layout hygiene, not runtime-state safety). Run it by hand when touching
+`gateway/commands/`.
+
+---
+
+## `scripts/ci/check_timezone_anchors.py` — timezone-anchoring guard
+
+Since `/tz` there are two clocks (`ISRAEL_TZ` and `owner_tz()`), and a wrong pick is invisible
+at home — it only misbehaves while the owner is abroad, so no home test catches it. A pure
+static scan enforcing two things: the seam (nothing outside `timeutils.py` constructs
+`ZoneInfo("Asia/Jerusalem")` or touches `owner_tz.json`), and a declared-anchoring roster —
+every module importing `timeutils` must appear in the guard's `ANCHORS` as `home`, `owner`, or
+`both`. A new time consumer fails until someone applies the rule: *follow the owner only if the
+data source physically travels with the owner*; fixed-place and Israel-dated surfaces stay home.
+Stale entries fail too, so the roster can't rot. The guard forces the question, not the answer.
+
+```bash
+venv/bin/python scripts/ci/check_timezone_anchors.py   # exit 0 clean, 1 on a defect
+```
+
+**Merge** only — its own `timezone-anchors` CI job. Pure static scan, no app import.
+
+---
+
+## `scripts/jrestart.sh` / `jrestart-staging.sh` — restart and show what booted
+
+Restart one instance and print **that boot's** `Running code:` provenance block (branch,
+sha, deploy tag, `root :`, proactive toggles) — so you immediately see what came up.
+Owner‑run (needs root); run them from inside the container.
+
+```bash
+scripts/jrestart.sh            # prod    → jarvis.service
+scripts/jrestart-staging.sh    # staging → jarvis-staging.service (also cold-starts it)
+```
+
+Read the printed block first. For staging the `root : /app/jarvis_staging` row is the
+isolation check — it confirms you booted against the staging trees, not prod (this is
+what replaces the single-writer lock the design dropped).
+
+### Quick commands
+
+**Privilege.** `deploy.sh` and `rollback.sh` need **no** root — they do git + pip only —
+and they **self-drop to the checkout owner** (`jarvis_user`) if you invoke them as root, so
+running git as root never corrupts the tree's ownership. The **restart** scripts *do* need
+root (they call `systemctl`). So: deploy as anyone, restart as root.
+
+**Inside the container** (`pct enter 106`, root shell):
+
+```bash
+/app/jarvis_code/deploy/deploy.sh                       # deploy prod (drops to jarvis_user itself)
+/app/jarvis_code/scripts/jrestart.sh                    # then restart prod + show the boot block
+/app/jarvis_staging/code/scripts/jrestart-staging.sh    # restart / cold-start staging
+```
+
+**From the PVE host** — drop these in `/root/.bashrc` (each wraps the in-container script
+with `pct exec 106`):
+
+```bash
+alias jrestart='pct exec 106 -- /app/jarvis_code/scripts/jrestart.sh'
+alias jrestart-staging='pct exec 106 -- /app/jarvis_staging/code/scripts/jrestart-staging.sh'
+alias jdeploy='pct exec 106 -- /app/jarvis_code/deploy/deploy.sh'
+```
+
+`jdeploy` runs the fail‑closed `deploy.sh` (it never restarts); follow a green deploy with
+`jrestart` to bring the new code up. Keeping deploy and restart as two steps is deliberate —
+a restart drops in‑flight turns, so it stays a conscious second step.
+
+---
+
+## Temporarily enabling a proactive toggle in staging
+
+Staging boots inert by design — `JARVIS_WEBHOOK_ENABLED` / `JARVIS_HEARTBEAT_ENABLED` /
+`JARVIS_REMINDERS_ENABLED` all default off in `config.py`, and the committed
+`deploy/jarvis-staging.service` sets none of them. Two things to know before flipping
+one on for a test:
+
+- **`secrets/.env` won't do it.** `main.py` imports `config` (which reads these three via
+  `os.environ` at module‑import time) *before* it calls `load_dotenv()`. Only a real
+  process‑environment variable reaches them — anything added to `secrets/.env` is parsed
+  too late for these three flags specifically. (Every other env var — `JARVIS_DEFAULT_CHANNEL`,
+  `APP_HUB_URL`, channel tokens — is read lazily at call time and works fine from `.env`.)
+- **Don't touch the committed `deploy/jarvis-staging.service`** — a test‑only `Environment=`
+  line left in there ships to every future clone.
+
+Two ways to set the real env var, in increasing order of how much they touch the host:
+
+**Direct run, bypassing systemd** — no disk footprint, nothing to revert (from
+[`plans/archive/HEARTBEAT_TICK_PHASE_PLAN.md`](plans/archive/HEARTBEAT_TICK_PHASE_PLAN.md)):
+```bash
+sudo systemctl stop jarvis-staging     # systemd's own copy must not also be running
+su jarvis_user -s /bin/bash -c \
+  'cd /app/jarvis_staging/code && JARVIS_ROOT=/app/jarvis_staging JARVIS_HEARTBEAT_ENABLED=true venv/bin/python3 main.py'
+# Ctrl-C to stop, then: sudo systemctl start jarvis-staging
+```
+Foregrounds the process in your terminal as `jarvis_user`; the var lives only in that one
+command. Trade‑off: no `Restart=always` / journald integration for the run, and it ties up
+the terminal (background it with `nohup … &` or a `tmux` pane if you need it detached).
+
+**`systemctl edit` drop‑in** — stays under systemd supervision/logging, but persists on
+disk until reverted:
+```bash
+sudo systemctl edit jarvis-staging.service
+# add under [Service]:
+#   Environment="JARVIS_HEARTBEAT_ENABLED=true"
+jrestart-staging
+# when done:
+sudo systemctl revert jarvis-staging.service
+jrestart-staging
+```
+
+---
+
+## Common workflows
+
+**Deploy a change** (once it's merged to `origin/main`):
+```bash
+cd /app/jarvis_code && ./deploy/deploy.sh
+pct exec 106 -- systemctl restart jarvis.service
+scripts/jrestart.sh
+```
+
+**Roll back a bad deploy:** `deploy/rollback.sh` (see above), then restart. If the bad
+deploy changed a persisted format, rollback also restores that deploy's pre‑pull tarball.
+
+**Snapshot before a risky manual edit:** `deploy/backup_state.sh <label>` (service
+stopped for a clean DB), edit, and `--restore` that tarball if it goes wrong.

@@ -1,0 +1,523 @@
+"""Slash-command handlers. Each function returns the reply text shown to
+the user; the router (`gateway/commands/router.py`) drives dispatch.
+
+Handlers reach into `agent` for the LangGraph executor and the shared sqlite
+connection — that's the gateway↔agent boundary, not the channel↔gateway
+boundary, so it's fine. No handler may import a concrete channel module.
+
+Adding a handler
+----------------
+An `async def` taking `(inbound, args)` and returning the reply text, decorated
+with `@command(name, description)`. The router auto-discovers it.
+
+**Build the reply with `gateway.commands.format` — never hand-rolled markdown.**
+A reply crosses two renderers that disagree about a bare newline: Telegram's
+converter is line-based, CommonMark (the app) treats it as a soft break and
+flows the lines into one paragraph. The same collapse was fixed three times in
+isolation before the helpers existed. They are:
+
+    section("Available commands", items)   # **header**, blank line, "- item" each
+    kv_section("Jarvis status", pairs)     # same, rendered "- **key**: value"
+    document("HEARTBEAT.md", body)         # a header above raw file content
+    join(block_a, block_b)                 # blank-line-separated blocks
+
+    @command("things", "List the things")
+    async def _things(inbound: InboundMessage, args: list[str]) -> str:
+        return section("Things", [f"`{t.name}` — {t.detail}" for t in things()])
+
+A one-line reply ("Conversation reset.") needs no helper — the rules only bite
+once a reply has two lines. Never emit a literal `•`: Telegram's converter only
+rewrites the `- ` marker, so a hand-typed bullet passes there and stays inert
+prose in the app.
+
+Then add a case to `scripts/ci/check_command_replies.py` — it fails on any
+command registered without one, so the layout decision is made explicitly
+(`strict`, or `raw` when the reply is verbatim file content the handler doesn't
+own). Full contract: `gateway/commands/format.py` and
+docs/architecture/GATEWAY.md § Reply formatting.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from gateway.base import InboundMessage
+from gateway.commands.format import document, join, kv_section, section
+from gateway.commands.router import command, list_commands
+
+logger = logging.getLogger(__name__)
+
+
+@command("help", "List available slash commands")
+async def _help(inbound: InboundMessage, args: list[str]) -> str:
+    return section(
+        "Available commands",
+        [f"`/{c.name}` — {c.description}" for c in list_commands()],
+    )
+
+
+@command("clear", "Reset this conversation (wipe agent memory for this thread)")
+async def _clear(inbound: InboundMessage, args: list[str]) -> str:
+    import agent
+
+    def _wipe() -> None:
+        with agent.conn:
+            agent.conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?", (inbound.thread_id,)
+            )
+            agent.conn.execute(
+                "DELETE FROM writes WHERE thread_id = ?", (inbound.thread_id,)
+            )
+
+    await asyncio.to_thread(_wipe)
+    return "Conversation reset. Starting fresh."
+
+
+@command("context", "Show the compacted record of earlier conversation, if there is one")
+async def _context(inbound: InboundMessage, args: list[str]) -> str:
+    import compaction
+
+    record = await asyncio.to_thread(compaction.current_record, inbound.thread_id)
+    if not record:
+        return section("Context", [], empty="No compacted record yet — the whole conversation is still in the window.")
+    return document("Compacted record (what Jarvis keeps of the earlier conversation)", record)
+
+
+@command("compact", "Compact the earlier conversation now (keeps the last 3 turns)")
+async def _compact(inbound: InboundMessage, args: list[str]) -> str:
+    import compaction
+
+    plan = await asyncio.to_thread(compaction.compact_thread, inbound.thread_id, True)
+    if plan is None:
+        return section("Compact", [], empty="Nothing to compact — the conversation is only a few turns long.")
+    return kv_section("Compacted", [
+        ("Messages replaced", plan.covered),
+        ("Record size", f"{plan.after_chars:,} chars (was {plan.before_chars:,})"),
+        ("Outcome", plan.outcome),
+        ("Skills kept on", ", ".join(sorted(plan.active_skills)) or "none"),
+    ])
+
+
+# TODO(#176): consider removing once memory suggestions end.
+@command("dream", "Write the daily log and send the memory suggestions now. Sub: /dream yesterday|today")
+async def _dream(inbound: InboundMessage, args: list[str]) -> str:
+    import datetime as _dt
+
+    import dream
+    from timeutils import ISRAEL_TZ
+
+    which = (args[0].lower() if args else "yesterday")
+    if which not in ("yesterday", "today"):
+        return section("Usage", ["`/dream [yesterday|today]` — today covers the day so far"])
+    day = _dt.datetime.now(_dt.timezone.utc).astimezone(ISRAEL_TZ).date()
+    if which == "yesterday":
+        day -= _dt.timedelta(days=1)
+    log, suggestions = await dream.run(day)
+    return kv_section("Morning job", [
+        ("Day", day.isoformat()),
+        ("Daily log", {"written": f"written — `/logs {day:%d.%m.%Y}`",
+                       "nothing": "nothing happened that day",
+                       "failed": "failed — see the log"}[log]),
+        ("Memory suggestions", {"sent": "sent as a message",
+                                "nothing": "nothing to send (no conversation, or nothing worth suggesting)",
+                                "failed": "failed — see the log"}[suggestions]),
+    ])
+
+
+def _active_skills(thread_id: str) -> set[str]:
+    import agent
+
+    try:
+        state = agent.agent_executor.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+    except Exception:
+        logger.exception("get_state failed for thread %s", thread_id)
+        return set()
+    values = getattr(state, "values", {}) or {}
+    return set(values.get("active_skills") or [])
+
+
+@command("skills", "Show active and available skills")
+async def _skills(inbound: InboundMessage, args: list[str]) -> str:
+    """Mirrors registry.compact_skill_list's discovery convention: top-level
+    skills are always listed; sub-skills indent under their parent only when
+    the parent is active. Active sub-skills with an inactive parent appear as
+    their own top-level entry in the Active section so nothing active is
+    invisible to the user."""
+    from tools import registry
+
+    active = _active_skills(inbound.thread_id)
+    all_ns = sorted(registry.skill_namespaces())
+    top = [n for n in all_ns if "/" not in n]
+    children: dict[str, list[str]] = {}
+    for n in all_ns:
+        if "/" in n:
+            children.setdefault(n.split("/", 1)[0], []).append(n)
+
+    def _line(ns: str, indent: int = 0) -> str:
+        desc, _ = registry._skill_meta(ns)
+        return f"{'  ' * indent}**{ns}**: {desc or '(no description)'}"
+
+    # Active section — every active namespace must appear here.
+    active_lines: list[str] = []
+    for ns in top:
+        if ns in active:
+            active_lines.append(_line(ns))
+            for child in children.get(ns, []):
+                if child in active:
+                    active_lines.append(_line(child, indent=1))
+    # Standalone-active sub-skills (parent not active) shown flat so they
+    # aren't hidden from the user.
+    for ns in all_ns:
+        if "/" in ns and ns in active and ns.split("/", 1)[0] not in active:
+            active_lines.append(_line(ns))
+
+    # Available section — top-level always; sub-skills only under active parents
+    # (mirroring compact_skill_list's two-step discovery). Active top-level
+    # skills get a back-reference instead of being re-listed in full.
+    available_lines: list[str] = []
+    for ns in top:
+        if ns in active:
+            available_lines.append(f"**{ns}** (active — see above)")
+            for child in children.get(ns, []):
+                if child not in active:
+                    available_lines.append(_line(child, indent=1))
+        else:
+            available_lines.append(_line(ns))
+
+    return join(
+        section("Active skills", active_lines),
+        section("Available skills", available_lines),
+    )
+
+
+@command("status", "Show runtime status (model, scope, active skills, tools)")
+async def _status(inbound: InboundMessage, args: list[str]) -> str:
+    import agent
+    from tools import registry
+
+    core_n, skill_n, ns_n = registry.registered_counts()
+    active = _active_skills(inbound.thread_id)
+    model_name = getattr(agent.llm, "model", "unknown")
+    return kv_section(
+        "Jarvis status",
+        [
+            ("model", model_name),
+            ("scope", "user"),
+            ("thread", inbound.thread_id),
+            ("active skills", ", ".join(sorted(active)) if active else "none"),
+            (
+                "tools registered",
+                f"{core_n} core + {skill_n} skill across {ns_n} namespace(s)",
+            ),
+        ],
+    )
+
+
+def _memory_list_top_level() -> str:
+    """Top-level memory files only — excludes daily/ (older logs) and heartbeat/
+    (use /heartbeat list) subdirs, which have their own surfaces."""
+    import os
+    import config
+
+    try:
+        entries = sorted(
+            f for f in os.listdir(config.MEMORY_DIR)
+            if f.endswith((".txt", ".md"))
+            and os.path.isfile(os.path.join(config.MEMORY_DIR, f))
+        )
+    except OSError as e:
+        return f"Error listing memory: {e}"
+    if not entries:
+        return "No top-level memory files."
+    return section("Memory files", entries)
+
+
+@command(
+    "memory",
+    "Show MEMORY.md index. Sub: /memory list, /memory <filename>",
+)
+async def _memory(inbound: InboundMessage, args: list[str]) -> str:
+    from tools.core.memory import read_memory
+
+    if args == ["list"]:
+        return await asyncio.to_thread(_memory_list_top_level)
+    if args:
+        return await asyncio.to_thread(read_memory.invoke, {"filename": " ".join(args)})
+    return await asyncio.to_thread(read_memory.invoke, {"filename": "MEMORY.md"})
+
+
+def _heartbeat_list_tasks() -> str:
+    """Per-task state files under heartbeat/ — the curated task list lives in
+    HEARTBEAT.md (shown by /heartbeat with no args)."""
+    import os
+    import config
+
+    hb_dir = os.path.join(config.MEMORY_DIR, "heartbeat")
+    try:
+        entries = sorted(
+            f for f in os.listdir(hb_dir)
+            if f.endswith(".md") and os.path.isfile(os.path.join(hb_dir, f))
+        )
+    except FileNotFoundError:
+        return "No heartbeat task state files yet."
+    except OSError as e:
+        return f"Error listing heartbeat tasks: {e}"
+    if not entries:
+        return "No heartbeat task state files yet."
+    return section("Heartbeat task state files", entries)
+
+
+@command(
+    "heartbeat",
+    "Show HEARTBEAT.md task list. Sub: /heartbeat list, /heartbeat <task>",
+)
+async def _heartbeat(inbound: InboundMessage, args: list[str]) -> str:
+    import agent
+    from tools.core.memory import read_memory
+
+    if args == ["list"]:
+        return await asyncio.to_thread(_heartbeat_list_tasks)
+    if args:
+        name = " ".join(args)
+        if not name.endswith(".md"):
+            name = f"{name}.md"
+        return await asyncio.to_thread(
+            read_memory.invoke, {"filename": f"heartbeat/{name}"}
+        )
+
+    body = await asyncio.to_thread(agent.load_or_blank, agent._HEARTBEAT_MD_PATH)
+    if not body:
+        return "HEARTBEAT.md is empty or unreadable."
+    return document("HEARTBEAT.md", body)
+
+
+def _parse_log_date(arg: str) -> str | None:
+    """Resolve a /logs date arg to an ISO date string (YYYY-MM-DD).
+
+    Accepts:
+      - 'today' / 'yesterday'
+      - EU format with day first: D, D.M, D.M.Y (also accepts '/' for '.')
+      - Missing components default to the current month/year (Israel TZ).
+
+    Returns None on invalid input."""
+    import datetime as _dt
+    from timeutils import ISRAEL_TZ
+
+    israel_today = _dt.datetime.now(_dt.timezone.utc).astimezone(ISRAEL_TZ).date()
+
+    lowered = arg.lower()
+    if lowered == "today":
+        return israel_today.isoformat()
+    if lowered == "yesterday":
+        return (israel_today - _dt.timedelta(days=1)).isoformat()
+
+    # Bare day (no delimiter): use current month + year.
+    if arg.isdigit():
+        try:
+            return _dt.date(israel_today.year, israel_today.month, int(arg)).isoformat()
+        except ValueError:
+            return None
+
+    # Delimited forms: D.M, D.M.Y, D/M, D/M/Y. Missing month → current month;
+    # missing year → current year. Empty components are rejected as malformed.
+    for sep in (".", "/"):
+        if sep in arg:
+            parts = arg.split(sep)
+            if len(parts) not in (2, 3) or any(not p for p in parts):
+                return None
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError:
+                return None
+            if len(nums) == 2:
+                d, m = nums
+                y = israel_today.year
+            else:
+                d, m, y = nums
+            try:
+                return _dt.date(y, m, d).isoformat()
+            except ValueError:
+                return None
+    return None
+
+
+_LOGS_USAGE = section(
+    "Usage",
+    [
+        "`/logs [today|yesterday|D[.M[.Y]]]` — `.` or `/` as the date separator",
+        "Examples: `/logs`, `/logs yesterday`, `/logs 21` (this month), "
+        "`/logs 21.5`, `/logs 21.5.2026`",
+    ],
+)
+
+
+@command(
+    "logs",
+    "Show a day: today so far, or an earlier day's daily log. Sub: /logs today|yesterday|D[.M[.Y]]",
+)
+async def _logs(inbound: InboundMessage, args: list[str]) -> str:
+    import datetime as _dt
+
+    import daily_log
+    from episodes import today as episodes_today
+    from timeutils import ISRAEL_TZ
+
+    if not args:
+        iso = _parse_log_date("today")
+    else:
+        iso = _parse_log_date(" ".join(args).strip())
+        if iso is None:
+            return join("Invalid date.", _LOGS_USAGE)
+
+    day = _dt.date.fromisoformat(iso)
+    if day < _dt.datetime.now(_dt.timezone.utc).astimezone(ISRAEL_TZ).date():
+        log = await asyncio.to_thread(daily_log.read, day)
+        return log or f"No daily log for {day:%A %Y-%m-%d} (a day's log is written the next morning)."
+    background, conversation = await asyncio.to_thread(episodes_today.day_view, day)
+    return join(
+        f"**{day:%A %Y-%m-%d}**",
+        section("In the background", background),
+        section("Conversation", conversation),
+    )
+
+
+_USAGE_USAGE = section(
+    "Usage",
+    [
+        "`/usage [today|yesterday|week|D[.M[.Y]]] [user|heartbeat]`",
+        "Examples: `/usage`, `/usage yesterday`, `/usage week`, "
+        "`/usage week user`, `/usage 21.5`",
+    ],
+)
+
+
+@command(
+    "usage",
+    "Show LLM token / cost rollup. Sub: /usage today|yesterday|week|D[.M[.Y]] [user|heartbeat]",
+)
+async def _usage(inbound: InboundMessage, args: list[str]) -> str:
+    """Rollup of recorded turns over a date range, optionally scope-filtered.
+
+    Trailing 'user' or 'heartbeat' token narrows the rollup to that scope.
+    Range token: today (default), yesterday, week (last 7 days incl. today),
+    or a /logs-style date (D, D.M, D.M.Y, '/'-or-'.' separator).
+    """
+    from observability import (
+        summarize_usage,
+        format_usage_table,
+        israel_day_range,
+        israel_last_n_days,
+        telemetry_errors,
+    )
+
+    tokens = [a.lower() for a in args]
+    scope_filter: str | None = None
+    if tokens and tokens[-1] in ("user", "heartbeat"):
+        scope_filter = tokens.pop()
+    range_token = tokens[0] if tokens else "today"
+
+    if range_token == "week":
+        since, until = israel_last_n_days(7)
+        group_by = "day" if scope_filter else "day+scope"
+        title = "**Usage — last 7 days**" + (f" ({scope_filter})" if scope_filter else "")
+    else:
+        iso = _parse_log_date(range_token)
+        if iso is None:
+            return join("Invalid date.", _USAGE_USAGE)
+        since, until = israel_day_range(iso)
+        group_by = "day" if scope_filter else "scope"
+        title = f"**Usage — {iso}**" + (f" ({scope_filter})" if scope_filter else "")
+
+    rows = await asyncio.to_thread(
+        summarize_usage,
+        since=since, until=until,
+        group_by=group_by, scope_filter=scope_filter,
+    )
+    errors = await asyncio.to_thread(telemetry_errors, since, until)
+    return format_usage_table(rows, title=title, telemetry_errors=errors)
+
+
+@command("tz", "Show or set the owner's current timezone (travel mode)")
+async def _tz(inbound: InboundMessage, args: list[str]) -> str:
+    """The explicit away-mode switch. No args shows the current mode; an IANA
+    name (`/tz Asia/Tokyo`) marks the owner away; `/tz home` returns. The state
+    is code-owned (jarvis_data/agent/owner_tz.json): the model sees it in its
+    prompt envelope but has no tool to change it."""
+    import datetime as dt
+
+    import timeutils
+
+    if not args:
+        away = timeutils.owner_tz_name()
+        pairs: list[tuple[str, str]] = [("Mode", f"away — {away}" if away else "home")]
+        if away:
+            pairs.append((
+                "Owner local time",
+                dt.datetime.now(timeutils.owner_tz()).strftime("%Y-%m-%d %H:%M"),
+            ))
+        pairs.append((
+            "Israel time",
+            dt.datetime.now(timeutils.ISRAEL_TZ).strftime("%Y-%m-%d %H:%M"),
+        ))
+        pairs.append(("Usage", "`/tz Asia/Tokyo` to go away, `/tz home` to return"))
+        return kv_section("Timezone", pairs)
+
+    name = args[0]
+    if name.lower() == "home":
+        timeutils.clear_owner_tz()
+        return "Away mode off — back on home time (Israel)."
+    try:
+        await asyncio.to_thread(timeutils.set_owner_tz, name)
+    except Exception:
+        return (
+            f"Unknown timezone '{name}'. Use an IANA name like `Europe/Lisbon` "
+            "or `Asia/Tokyo`, or `/tz home` to return."
+        )
+    local = dt.datetime.now(timeutils.owner_tz())
+    israel = dt.datetime.now(timeutils.ISRAEL_TZ)
+    return (
+        f"Away mode on — {name}. Owner local time {local.strftime('%Y-%m-%d %H:%M')}, "
+        f"Israel {israel.strftime('%H:%M')}."
+    )
+
+
+_TRIGGERS_USAGE = "Usage: `/triggers` to list, `/triggers cancel <id>` to cancel one."
+
+
+@command("triggers", "List scheduled reminders and wakes, or cancel one")
+async def _triggers(inbound: InboundMessage, args: list[str]) -> str:
+    """Pending triggers, read straight from the store — no model.
+    `cancel <id>` removes one and disarms its job."""
+    import timeutils
+    from triggers import scheduler, store
+    from triggers.model import ORIGIN_CODE, ORIGIN_OWNER, Turn
+
+    if args and args[0].lower() == "cancel":
+        if len(args) < 2:
+            return _TRIGGERS_USAGE
+        trigger_id = args[1]
+        match = await asyncio.to_thread(store.get, trigger_id)
+        if match is None:
+            return f"Nothing scheduled with id `{trigger_id}`."
+        await asyncio.to_thread(store.remove, trigger_id)
+        scheduler.disarm(trigger_id)
+        kind = "wake" if isinstance(match.action, Turn) else "reminder"
+        return f"Cancelled {kind} `{trigger_id}`."
+    if args:
+        return _TRIGGERS_USAGE
+
+    items = []
+    for t in sorted(await asyncio.to_thread(store.all_triggers), key=lambda x: x.when.instant):
+        when = t.when.instant.astimezone(timeutils.ISRAEL_TZ).strftime("%a %d.%m %H:%M")
+        if isinstance(t.action, Turn):
+            kind, body = "wake", t.action.instruction
+        else:
+            kind, body = "reminder", t.action.text
+        source = {ORIGIN_OWNER: "from chat", ORIGIN_CODE: f"automatic, {t.parent}"}.get(
+            t.origin, "set by Jarvis")
+        excerpt = body if len(body) <= 80 else body[:79] + "…"
+        items.append(f"`{t.id}` {when} — {kind}, {source}: {excerpt}")
+    return section("Scheduled", items, empty="_Nothing scheduled._")

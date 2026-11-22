@@ -1,0 +1,395 @@
+import asyncio
+import logging
+import os
+import signal
+import subprocess
+from uuid import uuid4
+import uvicorn
+from dotenv import load_dotenv
+
+# Instance paths — first project import (validates JARVIS_ROOT, derives every path).
+import config
+
+from agent import ask_jarvis, ask_jarvis_once, keep_db_small
+import heartbeat_state
+import dream
+from heartbeat import run_heartbeat
+from triggers.scheduler import add_dream, add_heartbeat, init_scheduler, restore_pending
+from gateway.base import InboundMessage
+from gateway.commands import try_handle_command
+from gateway.factory import build_stack, default_outbox
+from gateway.outbox import Outbox
+from gateway.webhook.notifier import MediaNotificationManager
+from gateway.webhook.server import create_webhook_app
+from tools.core import (
+    append_chat_log,
+    async_append_notification_log,
+    trim_log,
+    CHAT_LOG,
+    NOTIFICATION_LOG,
+)
+from observability import store as telemetry_store
+from episodes import record as episodes_record
+from files import attachments as file_attachments
+from files import startup as file_startup
+from files import worker as file_worker
+
+# 1. Enable logging for debugging and monitoring
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+# Suppress noisy polling and ASGI request logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# 2. Load environment variables securely from this instance's secrets dir. Channel
+# -specific config (bot token, owner id) is read by the channel factory, not here.
+load_dotenv(config.ENV_FILE)
+
+
+# One turn at a time on the owner thread. Each channel serializes its own
+# updates, but nothing serialized Telegram against jarvis-app — harmless while
+# they wrote separate threads, a checkpoint race once both write "owner".
+_owner_turn_lock = asyncio.Lock()
+
+
+async def process_inbound_message(inbound: InboundMessage) -> str | None:
+    """Domain-level processing: chat history + agent call. No channel-specific parsing here."""
+    command_reply = await try_handle_command(inbound)
+    if command_reply is not None:
+        await asyncio.to_thread(append_chat_log, "user", inbound.user_text, inbound.thread_id)
+        await asyncio.to_thread(append_chat_log, "assistant", command_reply, inbound.thread_id)
+        await asyncio.to_thread(
+            episodes_record.slash_command, thread_id=inbound.thread_id,
+            channel=inbound.channel or None, command=inbound.user_text, reply=command_reply,
+        )
+        return command_reply
+
+    # Files are saved before waiting for the turn lock, so they are kept even if
+    # the queued turn later fails; the turn id is minted here so each file names
+    # the turn it arrived in.
+    turn_id = uuid4().hex
+    records, notes = await asyncio.to_thread(
+        file_attachments.save_attachments, inbound.attachments,
+        caption=inbound.user_text, turn_id=turn_id,
+    )
+    user_text = "\n".join([inbound.user_text, *notes]).strip()
+    await asyncio.to_thread(
+        append_chat_log, "user", user_text, inbound.thread_id,
+        file_ids=[r.id for r in records],
+    )
+
+    return await run_owner_turn(
+        user_text,
+        inbound.thread_id,
+        channel=inbound.channel or None,
+        files=records or None,
+        turn_id=turn_id,
+    )
+
+
+async def run_owner_turn(
+    user_text: str,
+    thread_id: str,
+    *,
+    channel: str | None = None,
+    files: list | None = None,
+    input_role: str | None = None,
+    turn_id: str | None = None,
+) -> str:
+    """One user-scope turn under the owner lock; the single path every
+    conversational caller goes through. Returns the reply — for a turn that did
+    not finish, the runtime's honest account of what happened and what already
+    landed — and chat-logs it when non-empty."""
+    async with _owner_turn_lock:
+        outcome = await asyncio.to_thread(
+            ask_jarvis,
+            user_text,
+            thread_id,
+            channel=channel,
+            files=files,
+            input_role=input_role,
+            turn_id=turn_id,
+        )
+    if outcome.text:
+        await asyncio.to_thread(append_chat_log, "assistant", outcome.text, thread_id)
+    _schedule_compaction(thread_id)
+    file_worker.kick()
+    return outcome.text
+
+
+_compacting: set[str] = set()
+
+
+def _schedule_compaction(thread_id: str) -> None:
+    """After a turn, compact the thread in the background if it has grown past
+    the limit. Prepared (with its model call) outside the owner lock, applied
+    under it, and only if no turn changed the thread in between."""
+    if thread_id in _compacting:
+        return
+
+    async def run() -> None:
+        import compaction
+        from observability import telemetry
+
+        def prepare():
+            with telemetry.job("compaction"):
+                return compaction.prepare(thread_id)
+
+        _compacting.add(thread_id)
+        try:
+            plan = await asyncio.to_thread(prepare)
+            if plan is not None:
+                async with _owner_turn_lock:
+                    await asyncio.to_thread(compaction.apply, plan)
+        except Exception:
+            logger.exception("Background compaction failed for %s", thread_id)
+        finally:
+            _compacting.discard(thread_id)
+
+    asyncio.get_running_loop().create_task(run())
+
+
+def _running_provenance() -> dict:
+    """Git identity + instance root of the tree this process is running from — for
+    the startup log, so the journal always answers 'what code, which instance?'. The
+    git lookups never raise: any failure (git absent, not a repo) degrades to
+    'unknown' rather than blocking startup. root/instance come from config and are
+    always present. Returns fields; main() formats them."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+
+    try:
+        # --exact-match exits non-zero (empty stdout) when HEAD is not on a tag.
+        tag = _git("describe", "--tags", "--exact-match", "HEAD")
+        return {
+            "branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
+            "sha": _git("rev-parse", "--short", "HEAD") or "unknown",
+            "dirty": bool(_git("status", "--porcelain")),
+            "subject": _git("log", "-1", "--format=%s") or "unknown",
+            "date": _git("log", "-1", "--format=%cs") or "unknown",  # %cs = YYYY-MM-DD
+            "deploy": tag if tag.startswith("deploy-") else "none",
+            # Detached HEAD = a rollback (rollback.sh checks out a deploy tag). Loud
+            # in the block so a rolled-back prod says so on every boot, not silently.
+            "detached": not _git("symbolic-ref", "-q", "HEAD"),
+            "root": config.ROOT,
+            "instance": config.INSTANCE,
+            "heartbeat": config.HEARTBEAT_ENABLED,
+            "reminders": config.REMINDERS_ENABLED,
+            "webhook": config.WEBHOOK_ENABLED,
+            "webhook_port": config.WEBHOOK_PORT,
+        }
+    except Exception:
+        return {"branch": "unknown", "sha": "unknown", "dirty": False,
+                "subject": "unknown", "date": "unknown", "deploy": "none", "detached": False,
+                "root": config.ROOT, "instance": config.INSTANCE,
+                "heartbeat": config.HEARTBEAT_ENABLED, "reminders": config.REMINDERS_ENABLED,
+                "webhook": config.WEBHOOK_ENABLED, "webhook_port": config.WEBHOOK_PORT}
+
+
+def _provenance_block(p: dict) -> str:
+    """Multi-line, labelled startup readout — legible in the journal/terminal tail.
+
+    STABLE LOG ANCHOR: the ``Running code:`` header is a contract, not just a
+    label — ``scripts/jrestart.sh`` greps it to capture the block, and it is the
+    last startup line by design. Do not rename it or move it off the tail;
+    adding labelled rows below is fine (slices 2-3 do exactly that)."""
+    sha = p["sha"] + (" (uncommitted)" if p["dirty"] else "")
+    hb = "on" if p["heartbeat"] else "off"
+    rem = "on" if p["reminders"] else "off"
+    wh = f"on :{p['webhook_port']}" if p["webhook"] else "off"
+    block = (
+        "Running code:\n"
+        f"    branch    : {p['branch']} @ {sha}\n"
+        f"    commit    : {p['subject']} — {p['date']}\n"
+        f"    deploy    : {p['deploy']}\n"
+        f"    root      : {p['root']}  (instance: {p['instance']})\n"
+        f"    proactive : heartbeat={hb} reminders={rem} webhook={wh}"
+    )
+    if p.get("detached"):
+        block += "\n    !! HEADS UP : HEAD is DETACHED (rolled back) — deploy.sh needs --force to leave"
+    return block
+
+
+async def main() -> None:
+    """
+    Starts the channel stack and the FastAPI webhook server inside a single
+    asyncio event loop, so they share the stack without inter-process
+    communication.
+    """
+    provenance = _running_provenance()
+    logger.info("Starting Jarvis...")
+    # Compact identity early, so a startup that crashes before 'online' still
+    # says what code it was. The full block is logged last (tail-visible).
+    logger.info(
+        "Running: %s @ %s%s",
+        provenance["branch"], provenance["sha"],
+        " (uncommitted)" if provenance["dirty"] else "",
+    )
+
+    try:
+        logger.info("Telemetry store trimmed: %s", telemetry_store.trim())
+    except Exception:
+        logger.exception("Telemetry store maintenance failed")
+    keep_db_small()
+    try:
+        logger.info("File store: %s",
+                    await asyncio.to_thread(file_startup.prepare))
+    except Exception:
+        logger.exception("File store upkeep failed")
+
+    async def log_notification(event: str, text: str, metadata: dict) -> None:
+        """Every delivered proactive send: the JSONL log and the episode store."""
+        await async_append_notification_log(event, text, metadata)
+        await asyncio.to_thread(episodes_record.notification, event, text, metadata)
+
+    async def save_sent_file(attachment: dict, caption: str | None):
+        return await asyncio.to_thread(file_attachments.save_sent, attachment, caption)
+    for log_path in (CHAT_LOG, NOTIFICATION_LOG):
+        trim_log(log_path)
+        logger.info("Log trimmed: %s", log_path)
+
+    async def on_confirmation_outcome(
+        system_text: str, thread_id: str, outbox: Outbox
+    ) -> None:
+        """Feed a resolved confirmation back through the agent on the ORIGIN
+        channel's thread so Jarvis acknowledges it conversationally there, then
+        reply via that channel's outbox. thread_id/outbox are the origin
+        channel's, supplied by its confirmation store."""
+        try:
+            await asyncio.to_thread(append_chat_log, "user", system_text, thread_id)
+            reply = await run_owner_turn(system_text, thread_id, input_role="system")
+            if reply:
+                # Conversational reply, already chat-logged — no notification event.
+                await outbox.notify_owner(reply)
+        except Exception:
+            logger.exception("Failed to deliver confirmation outcome")
+
+    # Build and wire the channel stack (channel + router + confirmation
+    # store/UI + outbox + host). Registers the defaults for proactive sends
+    # and the confirmation backend for destructive tools; reads its own
+    # config env.
+    stack = build_stack(
+        "telegram",
+        on_message=process_inbound_message,
+        on_confirmation_outcome=on_confirmation_outcome,
+        log_sink=log_notification,
+        save_file=save_sent_file,
+    )
+
+    # Optional second channel: the jarvis-app hub, built only when APP_HUB_URL is
+    # set — an instance without it (prod today) constructs nothing and is
+    # byte-identical to before. A misconfigured app channel must never take down
+    # the primary channel, so a build failure logs and continues without it.
+    app_stack = None
+    if os.getenv("APP_HUB_URL"):
+        try:
+            app_stack = build_stack(
+                "jarvis-app",
+                on_message=process_inbound_message,
+                on_confirmation_outcome=on_confirmation_outcome,
+                log_sink=log_notification,
+                save_file=save_sent_file,
+            )
+        except Exception:
+            logger.exception("jarvis-app channel misconfigured — continuing without it")
+
+    async def _llm_format(prompt: str) -> str:
+        return await asyncio.to_thread(ask_jarvis_once, prompt)
+
+    notifier = MediaNotificationManager(default_outbox, llm_format=_llm_format)
+
+    # FastAPI webhook server — only when enabled. Staging runs without it, so it
+    # neither binds a port nor collides with prod's :8000. When off, the channel +
+    # scheduler still run and a stop-signal wait (below) owns the process lifecycle.
+    webhook_server = None
+    if config.WEBHOOK_ENABLED:
+        fastapi_app = create_webhook_app(notifier)
+        webhook_server = uvicorn.Server(
+            uvicorn.Config(fastapi_app, host="0.0.0.0", port=config.WEBHOOK_PORT, log_level="warning")
+        )
+
+    # Init APScheduler and register the heartbeat job before the channel comes
+    # up, so an inbound turn can never observe a missing scheduler. Jobs don't
+    # run until scheduler.start() below.
+    scheduler = init_scheduler()
+    if config.HEARTBEAT_ENABLED:
+        add_heartbeat(run_heartbeat)
+        add_dream(dream.run_scheduled)
+
+    # Channel up: binds the outbox loop and starts inbound handling, so
+    # everything after this point (past-due reminders, scheduler jobs) can send.
+    await stack.start()
+
+    # Second channel, if built: start its poll loop (a background task). The
+    # primary channel's start() already bound the shared outbox loop.
+    if app_stack is not None:
+        await app_stack.start()
+        logger.info("jarvis-app channel active (hub polling).")
+
+    records_worker = None
+    try:
+        # Re-arm stored triggers. Skipped when reminders are disabled — staging
+        # must not re-fire the owner's real events. Hold references to past-due
+        # runs so they can't be GC'd.
+        past_due_tasks = restore_pending() if config.REMINDERS_ENABLED else []
+
+        scheduler.start()
+        records_worker = file_worker.start()
+        # A restart across the morning slot would otherwise skip the day's
+        # log and suggestions: APScheduler keeps no record of a run it never saw. The
+        # reference keeps the task from being collected.
+        catch_up = None
+        if config.HEARTBEAT_ENABLED and dream.catch_up_due():
+            catch_up = asyncio.get_running_loop().create_task(dream.run_scheduled())
+        if config.HEARTBEAT_ENABLED:
+            # Next fire time in the boot block: makes the phase checkable at a
+            # glance instead of waiting for the first tick to hit the journal.
+            next_run = getattr(scheduler.get_job("heartbeat"), "next_run_time", None)
+            logger.info(
+                "Scheduler started. Heartbeat every %dh on the hour (UTC); next tick %s.",
+                heartbeat_state.TICK_INTERVAL_HOURS,
+                next_run.isoformat() if next_run else "unknown",
+            )
+        else:
+            logger.info("Scheduler started. Heartbeat disabled.")
+        if webhook_server is not None:
+            logger.info("Jarvis is online. Channel active. Webhook server on :%d.", config.WEBHOOK_PORT)
+        else:
+            logger.info("Jarvis is online. Channel active. Webhook disabled.")
+        # The full provenance block is the LAST startup line, so `journalctl -n`/
+        # `systemctl status` show it in the tail without scrolling past boot noise.
+        logger.info("%s", _provenance_block(provenance))
+
+        if webhook_server is not None:
+            # uvicorn owns the process lifecycle: serve() blocks until SIGINT/SIGTERM.
+            await webhook_server.serve()
+        else:
+            # No webhook to block on — wait on a stop signal so the channel and
+            # scheduler keep running, then fall through to graceful shutdown.
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop.set)
+            await stop.wait()
+    finally:
+        logger.info("Shutdown signal received. Stopping channel...")
+        scheduler.shutdown(wait=False)
+        if records_worker is not None:
+            records_worker.cancel()
+        if app_stack is not None:
+            await app_stack.stop()
+        await stack.stop()
+
+    logger.info("Jarvis shut down cleanly.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,64 @@
+[
+  {
+    "destructive": false,
+    "name": "check_sleep",
+    "schema": {
+      "description": "Roi's Pixel Watch sleep for the last `nights` night(s); nights=1 = last\n    night. Reports bedtime, wake time, total asleep, sleep efficiency and the\n    stage breakdown. The Google Health API does NOT expose Fitbit's 0-100\n    sleep score — sleep efficiency (asleep / in-bed) is the closest proxy.",
+      "name": "check_sleep",
+      "parameters": {
+        "properties": {
+          "nights": {
+            "default": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "scopes": null
+  },
+  {
+    "destructive": false,
+    "name": "check_workouts",
+    "schema": {
+      "description": "Logged Pixel Watch workout/exercise sessions in a date range\n    (owner-local dates — Israel unless traveling). `since_date`/`until_date`\n    are inclusive YYYY-MM-DD;\n    `since_date=\"\"` defaults to today, `until_date=\"\"` means no upper bound.\n    For a single day, pass `since_date == until_date`. Reports per session:\n    name, time, duration, distance/pace/steps/elevation when available,\n    calories, avg HR, HR-zone minutes, and per-km splits for GPS sessions.\n    Manually-logged sessions are tagged `(manual)` — their kcal/HR are\n    MET-estimated, not measured.",
+      "name": "check_workouts",
+      "parameters": {
+        "properties": {
+          "since_date": {
+            "default": "",
+            "type": "string"
+          },
+          "until_date": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "scopes": null
+  },
+  {
+    "destructive": false,
+    "name": "health_status",
+    "schema": {
+      "description": "Roi's Pixel Watch daily health snapshot. Use for \"how am I doing\",\n    steps / activity on a day (\"yesterday's steps\"), resting heart rate, HRV,\n    recovery, or a week's trend.\n\n    Args:\n        day: YYYY-MM-DD, the owner-local day to report (or the last day of\n            the range); \"\" = today, which is partial.\n        days: 1 = that one day in full; 2-14 = one compact row per day ending\n            on `day`.\n\n    One day reports activity (steps, active zone minutes, calories burned,\n    sedentary time), recovery (sleep that ended that morning; resting HR and\n    HRV against the previous 7 days' average) and overnight vitals (SpO2,\n    breathing rate). Days without data say so — the watch may not have synced.\n    For sleep stages use check_sleep; for individual sessions check_workouts.",
+      "name": "health_status",
+      "parameters": {
+        "properties": {
+          "day": {
+            "default": "",
+            "type": "string"
+          },
+          "days": {
+            "default": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "scopes": null
+  }
+]

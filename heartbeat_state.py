@@ -1,0 +1,451 @@
+"""Code-owned heartbeat task state: HEARTBEAT.md parsing + last-run stamps.
+
+Two concerns the agent never touches directly:
+
+- ``parse_tasks()`` — a lenient read of the task definitions in HEARTBEAT.md
+  (name + cadence). A task whose cadence can't be parsed surfaces with
+  ``cadence=None`` so callers treat it as always due — a malformed line
+  degrades to "let the model look at it", never to a silently dropped task.
+- ``load_state()`` / ``stamp()`` — per-task last-run timestamps, kept in the
+  trigger store (``triggers/store.py``, ``last_run``), stamped only for the
+  tasks the agent reported acting on (its ``heartbeat_respond`` ack) or whose
+  gate completed. Unknown task names are logged and skipped, never fatal.
+
+The agent's own narrative notes (``heartbeat/<task>.md`` in the memory dir)
+are unrelated to this module and stay agent-owned.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timedelta, timezone
+from timeutils import ISRAEL_TZ as _ISRAEL_TZ
+
+import config
+
+logger = logging.getLogger(__name__)
+
+HEARTBEAT_PATH = os.path.join(config.MEMORY_DIR, "HEARTBEAT.md")
+
+
+# The tick lattice: minute 0 of every Nth hour. The gate rounds to it and the
+# scheduler's trigger is built from it, so the two cannot drift apart. Only
+# divisors of 24 are valid — a cron "*/N" hour field restarts at midnight, so
+# */5 fires 00,05,10,15,20 and then jumps 4h across the day boundary.
+TICK_INTERVAL_HOURS = 1
+_TICK_INTERVAL = timedelta(hours=TICK_INTERVAL_HOURS)
+
+# Slack for the cadence comparison. Ticks run exactly one interval apart,
+# but the gate's clock is read at job start, so consecutive reads sit a few
+# ms either side of the nominal interval — without slack, an every-1h task
+# stamped at the previous tick misses ~half its checks by milliseconds.
+# Doubles as the scheduler's misfire grace, bounding how far off-lattice a
+# late tick can stamp. Must stay well under the smallest supported cadence (1h).
+CADENCE_GRACE = timedelta(seconds=60)
+
+# Task header: "- **task-name** | every 24h | due: 06:00-22:00 | state: `heartbeat/x.md`"
+_HEADER_RE = re.compile(r"^-\s*\*\*(?P<name>[^*]+?)\*\*(?P<rest>.*)$")
+# Cadence: "every 1h" / "every 24h" / "every 7 days" / "every 2 hours"
+_CADENCE_RE = re.compile(r"every\s+(?P<n>\d+)\s*(?P<unit>hours?|days?|h|d)\b", re.IGNORECASE)
+# Optional due window field inside the header's "|"-separated segments.
+_DUE_FIELD_RE = re.compile(r"due:\s*(?P<spec>[^|`]+)", re.IGNORECASE)
+# Optional "paused" flag: a bare field of its own between pipes. Anchored to
+# the field boundaries so it cannot be matched out of a word in the notes path
+# or an instruction fragment that shares the line.
+_PAUSED_RE = re.compile(r"(?:^|\|)\s*paused\s*(?=\||$)", re.IGNORECASE)
+# Optional "gate: <name>" field: the task's check runs in code (triggers/gates.py)
+# instead of in the tick's model turn. Same field-boundary anchoring as paused.
+_GATE_RE = re.compile(r"(?:^|\|)\s*gate:\s*(?P<name>[A-Za-z0-9_-]+)\s*(?=\||$)", re.IGNORECASE)
+# The task's notes file: "notes: `heartbeat/x.md`" (backticks optional).
+_NOTES_RE = re.compile(r"(?:^|\|)\s*notes:\s*`?(?P<path>[^`|\s]+)`?\s*(?=\||$)", re.IGNORECASE)
+# Window spec: "[Day[,Day...] ]HH:MM-HH:MM" or "[Day[,Day...] ]HH:MM±Nh"
+# (± also accepted as "+-" or "+/-" for ASCII-only editing).
+_WINDOW_RE = re.compile(
+    r"^(?:(?P<days>(?:mon|tue|wed|thu|fri|sat|sun)"
+    r"(?:\s*,\s*(?:mon|tue|wed|thu|fri|sat|sun))*)\s+)?"
+    r"(?P<h1>\d{1,2}):(?P<m1>\d{2})"
+    r"(?:\s*-\s*(?P<h2>\d{1,2}):(?P<m2>\d{2})"
+    r"|\s*(?:±|\+/-|\+-)\s*(?P<rad>\d+(?:\.\d+)?)\s*h)\s*$",
+    re.IGNORECASE,
+)
+_DAY_NUM = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+@dataclass(frozen=True)
+class DueWindow:
+    """A time-of-day window (Israel time), optionally limited to weekdays.
+
+    Exactly one of (``start``+``end``) or (``center``+``radius``) is set.
+    An end at or before the start wraps past midnight.
+    """
+
+    days: frozenset[int] | None  # weekday numbers, None = every day
+    start: dt_time | None = None
+    end: dt_time | None = None
+    center: dt_time | None = None
+    radius: timedelta | None = None
+
+    def is_open(self, now: datetime) -> bool:
+        now = now.astimezone(_ISRAEL_TZ)
+        # A window anchored to yesterday/today/tomorrow can contain `now`
+        # (ranges that wrap midnight, ± radii that cross a day boundary).
+        for day_offset in (-1, 0, 1):
+            day = (now + timedelta(days=day_offset)).date()
+            if self.days is not None and day.weekday() not in self.days:
+                continue
+            if self.center is not None:
+                center = datetime.combine(day, self.center, tzinfo=_ISRAEL_TZ)
+                if abs(now - center) <= self.radius:
+                    return True
+            else:
+                start = datetime.combine(day, self.start, tzinfo=_ISRAEL_TZ)
+                duration = (
+                    datetime.combine(day, self.end, tzinfo=_ISRAEL_TZ) - start
+                ) % timedelta(days=1)
+                if not duration:
+                    duration = timedelta(days=1)  # end == start: full day
+                if start <= now < start + duration:
+                    return True
+        return False
+
+
+def parse_window(spec: str) -> DueWindow | None:
+    """A ``DueWindow`` from a ``due:`` spec string, or None if unparseable."""
+    m = _WINDOW_RE.match(spec.strip())
+    if not m:
+        return None
+    try:
+        days = None
+        if m.group("days"):
+            days = frozenset(
+                _DAY_NUM[d.strip().lower()] for d in m.group("days").split(",")
+            )
+        t1 = dt_time(int(m.group("h1")), int(m.group("m1")))
+        if m.group("h2") is not None:
+            t2 = dt_time(int(m.group("h2")), int(m.group("m2")))
+            return DueWindow(days=days, start=t1, end=t2)
+        return DueWindow(
+            days=days, center=t1, radius=timedelta(hours=float(m.group("rad")))
+        )
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class HeartbeatTask:
+    name: str
+    cadence: timedelta | None  # None = unparseable → treat as always due
+    raw: str  # the header line as written
+    due: str | None = None  # raw due: spec, if present
+    window: DueWindow | None = None  # None = no (or unparseable) window → open
+    paused: bool = False  # owner-declared; skipped by the gate without running
+    gate: str | None = None  # checked in code, never in the tick's model turn
+    notes: str | None = None  # the header's notes: path (memory-relative), if given
+
+
+_parse_cache: tuple[str, float, list[HeartbeatTask]] | None = None  # (path, mtime, tasks)
+
+
+def split_blocks(text: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """Split HEARTBEAT.md content into (preamble lines, task blocks).
+
+    A block is a ``- **name**`` header line plus every following line up to
+    the next header (or EOF). The preamble is everything before the first
+    header. Pure text operation — no validation.
+    """
+    preamble: list[str] = []
+    blocks: list[tuple[str, list[str]]] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        m = _HEADER_RE.match(line.strip())
+        if m:
+            current = [line]
+            blocks.append((m.group("name").strip(), current))
+        elif current is not None:
+            current.append(line)
+        else:
+            preamble.append(line)
+    return preamble, blocks
+
+
+def parse_tasks(path: str = HEARTBEAT_PATH) -> list[HeartbeatTask]:
+    """Task definitions from HEARTBEAT.md, cached by file mtime.
+
+    Missing/unreadable file → empty list. Header lines are matched leniently;
+    anything that isn't a ``- **name**`` line is ignored (prose, numbered
+    steps, headings).
+    """
+    global _parse_cache
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    if _parse_cache is not None and _parse_cache[0] == path and _parse_cache[1] == mtime:
+        return _parse_cache[2]
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        logger.warning("heartbeat_state: cannot read %s", path)
+        return []
+
+    tasks = parse_tasks_text(text)
+    _parse_cache = (path, mtime, tasks)
+    return tasks
+
+
+def parse_tasks_text(text: str) -> list[HeartbeatTask]:
+    """Task definitions from HEARTBEAT.md-format text (uncached).
+
+    Same leniency as ``parse_tasks``; used to validate candidate content
+    before it is written.
+    """
+    tasks: list[HeartbeatTask] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        m = _HEADER_RE.match(line.strip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        rest = m.group("rest")
+        cm = _CADENCE_RE.search(rest)
+        cadence: timedelta | None = None
+        if cm:
+            n = int(cm.group("n"))
+            unit = cm.group("unit").lower()
+            cadence = timedelta(days=n) if unit.startswith("d") else timedelta(hours=n)
+        else:
+            logger.warning(
+                "heartbeat_state: no parseable cadence for task %r — treating as always due",
+                name,
+            )
+        due_raw: str | None = None
+        window: DueWindow | None = None
+        dm = _DUE_FIELD_RE.search(rest)
+        if dm:
+            due_raw = dm.group("spec").strip()
+            window = parse_window(due_raw)
+            if window is None:
+                logger.warning(
+                    "heartbeat_state: unparseable due window %r for task %r — "
+                    "treating as always open",
+                    due_raw,
+                    name,
+                )
+        tasks.append(
+            HeartbeatTask(
+                name=name,
+                cadence=cadence,
+                raw=line.strip(),
+                due=due_raw,
+                window=window,
+                paused=bool(_PAUSED_RE.search(rest)),
+                gate=(gm.group("name") if (gm := _GATE_RE.search(rest)) else None),
+                notes=(nm.group("path") if (nm := _NOTES_RE.search(rest)) else None),
+            )
+        )
+    return tasks
+
+
+def notes_path(task: HeartbeatTask) -> str:
+    """A task's notes file, memory-relative: its header's ``notes:`` path, or
+    the path a new task gets by default."""
+    return task.notes or f"heartbeat/{task.name.replace('-', '_')}.md"
+
+
+def skills_for(task_names: list[str] | None) -> set[str]:
+    """The skills the named tasks' last stamped runs ended with (a tick's warm
+    start). An unreadable store gives none — the tick activates what it needs."""
+    if not task_names:
+        return set()
+    from triggers import store
+
+    try:
+        saved = store.task_skills()
+    except Exception:
+        logger.exception("heartbeat_state: couldn't read task skills")
+        return set()
+    return {s for name in task_names for s in saved.get(name, [])}
+
+
+def remember_skills(task_names: list[str], skills: list[str]) -> None:
+    """Record the skills a stamped run ended with, for the tasks' next warm start."""
+    if not task_names:
+        return
+    from triggers import store
+
+    try:
+        store.set_task_skills(task_names, skills)
+    except Exception:
+        logger.exception("heartbeat_state: couldn't record task skills")
+
+
+def filter_heartbeat_md(text: str, due_names: list[str] | None) -> str:
+    """HEARTBEAT.md content with only the named task blocks kept.
+
+    The preamble (everything before the first task header) is preserved.
+    Task blocks not in ``due_names`` are collapsed into one terse note naming
+    them, so the model knows they exist and are simply not due — without
+    paying for their full bodies. Gated tasks are left out of the notes
+    entirely: code runs them, so they are never the model's to act on.
+    Unknown names in ``due_names`` are ignored. ``None`` (the due-gate
+    failed) keeps every task except the gated ones, with no notes.
+    """
+    preamble, blocks = split_blocks(text)
+    tasks = parse_tasks_text(text)
+    paused = {t.name for t in tasks if t.paused}
+    gated = {t.name for t in tasks if t.gate}
+    keep = set(due_names) if due_names is not None else {n for n, _ in blocks} - gated
+    blocks = [(n, b) for n, b in blocks if n in keep or n not in gated]
+    kept = [b for name, b in blocks if name in keep]
+    omitted = [n for n, _ in blocks if n not in keep and n not in paused]
+    omitted_paused = [n for n, _ in blocks if n not in keep and n in paused]
+
+    out: list[str] = []
+    if preamble:
+        out.append("\n".join(preamble).rstrip())
+    for block in kept:
+        out.append("\n".join(block).rstrip())
+    if omitted:
+        out.append(
+            f"({len(omitted)} other task(s) are not due this tick and are "
+            f"omitted here: {', '.join(omitted)}. Do not act on them; the "
+            f"full list lives in HEARTBEAT.md.)"
+        )
+    # Named apart from merely-not-due ones: "not due yet" invites the model to
+    # plan around a next run, which is wrong for a task switched off entirely.
+    if omitted_paused:
+        out.append(
+            f"({len(omitted_paused)} task(s) paused by the owner, not scheduled "
+            f"until resumed: {', '.join(omitted_paused)}.)"
+        )
+    return "\n\n".join(p for p in out if p)
+
+
+def load_state() -> dict:
+    """The last-run map: ``{"last_run": {"<task>": "<iso8601>", ...}}``.
+
+    An unreadable store reads as empty (every task then looks never-run,
+    i.e. due — the safe direction).
+    """
+    from triggers import store
+
+    return {"last_run": store.task_stamps()}
+
+
+def _floor_to_tick(when: datetime) -> datetime:
+    """``when`` rounded down to the tick lattice (minute 0 of every Nth hour)."""
+    hour = when.hour - (when.hour % TICK_INTERVAL_HOURS)
+    return when.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
+def any_due(
+    now: datetime | None = None,
+    *,
+    heartbeat_path: str = HEARTBEAT_PATH,
+) -> tuple[bool, list[str] | None]:
+    """Which tasks are cadence-due at ``now`` (default: now, UTC).
+
+    Returns ``(anything_due, due_names)``. ``due_names`` is ``None`` when the
+    answer is "unknown — run everything": an empty or unreadable HEARTBEAT.md
+    must degrade to running the model with the full task list, never to
+    silently skipping the tick.
+
+    A task is due when its cadence has elapsed (never stamped, stamp
+    unreadable, cadence unparseable, or ``now - last_run`` reaching the
+    cadence less ``CADENCE_GRACE`` — measured raw, or for cadences longer
+    than one tick, with both ends rounded down to the tick lattice) AND its
+    ``due:`` window — if it has a parseable one — is open at ``now``.
+    """
+    now = now or datetime.now(timezone.utc)
+    tasks = parse_tasks(heartbeat_path)
+    if not tasks:
+        logger.warning(
+            "heartbeat_state: no parseable tasks in %s — treating all as due",
+            heartbeat_path,
+        )
+        return True, None
+    last_run = load_state()["last_run"]
+
+    due: list[str] = []
+    for t in tasks:
+        # Paused wins over everything: no cadence maths, no window check, and
+        # the task never reaches due_names — so a tick with nothing else due
+        # returns without a model call at all.
+        if t.paused:
+            continue
+        if t.window is not None and not t.window.is_open(now):
+            continue
+        cadence_due = False
+        if t.cadence is None:
+            cadence_due = True
+        else:
+            raw = last_run.get(t.name)
+            if not raw:
+                cadence_due = True
+            else:
+                try:
+                    prev = datetime.fromisoformat(raw)
+                    if prev.tzinfo is None:
+                        prev = prev.replace(tzinfo=timezone.utc)
+                    threshold = t.cadence - CADENCE_GRACE
+                    cadence_due = now - prev >= threshold
+                    # A stamp that landed off the lattice reads short at every
+                    # remaining tick in the task's window, costing it the run.
+                    # Re-measure with both ends floored to rescue it — but only
+                    # above a single-tick cadence, since flooring discards up to
+                    # a whole tick: for an every-1h task it would call an
+                    # eight-minute-old stamp an hour old. A task whose cadence
+                    # is one tick is due from the raw comparison anyway.
+                    if not cadence_due and t.cadence > _TICK_INTERVAL:
+                        cadence_due = _floor_to_tick(
+                            now.astimezone(timezone.utc)
+                        ) - _floor_to_tick(prev.astimezone(timezone.utc)) >= threshold
+                except ValueError:
+                    logger.warning(
+                        "heartbeat_state: unreadable last_run for %r — treating as due",
+                        t.name,
+                    )
+                    cadence_due = True
+        if cadence_due:
+            due.append(t.name)
+    return bool(due), due
+
+
+def stamp(
+    task_names: list[str],
+    when: datetime | None = None,
+    *,
+    heartbeat_path: str = HEARTBEAT_PATH,
+) -> list[str]:
+    """Record ``when`` (default: now, UTC) as last_run for the named tasks.
+
+    Only names present in HEARTBEAT.md are stamped; unknown names are logged
+    and skipped. Nothing valid → no write. Returns the names actually stamped.
+    """
+    when = when or datetime.now(timezone.utc)
+    known = {t.name for t in parse_tasks(heartbeat_path)}
+    valid = [n.strip() for n in task_names if n and n.strip()]
+    stamped = [n for n in valid if n in known]
+    for unknown in set(valid) - set(stamped):
+        logger.warning(
+            "heartbeat_state: ack named unknown task %r — not stamping", unknown
+        )
+    if not stamped:
+        return []
+
+    from triggers import store
+
+    try:
+        store.stamp_tasks(stamped, when.isoformat())
+    except OSError:
+        logger.exception("heartbeat_state: failed to write stamps")
+        return []
+    return stamped

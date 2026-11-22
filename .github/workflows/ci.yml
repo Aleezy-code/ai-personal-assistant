@@ -1,0 +1,87 @@
+name: CI
+
+# The unbypassable half of the regression gate: runs on every PR and on pushes to
+# main. The test suite plus four independent guards, one job each:
+#   - tests             — the pytest suite in tests/ (no network, no secrets)
+#   - path-isolation    — no module hardcodes a prod state path (check_paths.py)
+#   - channel-agnostic  — the app stays channel-agnostic (check_channel_agnostic.py)
+#   - command-replies   — slash-command replies survive both renderers
+#                         (check_command_replies.py)
+#   - timezone-anchors  — every timezone consumer declares its clock
+#                         (check_timezone_anchors.py)
+# Make each a hard gate with a branch-protection rule on `main` (GitHub → Settings →
+# Branches) requiring its check to pass. (The pre-commit hook is the fast local half
+# and runs path-isolation and channel-agnostic — tests and command-replies boot the
+# app, too slow for a hook; see docs/DEPLOY.md.)
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Test suite
+        # tests/conftest.py sets a scratch JARVIS_ROOT and a dummy GOOGLE_API_KEY
+        # before any project import, so no real secrets are needed.
+        run: pytest -q
+
+  path-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches prod's venv
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Path-isolation check
+        # check_paths.py sets its own scratch JARVIS_ROOT + a dummy GOOGLE_API_KEY,
+        # so no real secrets are needed and the import makes no network call.
+        run: python scripts/ci/check_paths.py
+
+  channel-agnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Channel-agnosticism check
+        # Pure static source scan — no app import and no deps, so no pip install.
+        run: python scripts/ci/check_channel_agnostic.py
+
+  command-replies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Slash-command reply-layout check
+        # Runs every registered command against a seeded scratch JARVIS_ROOT (same
+        # dummy-secret trick as check_paths) and validates the reply markdown.
+        run: python scripts/ci/check_command_replies.py
+
+  timezone-anchors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Timezone-anchoring check
+        # Pure static source scan — no app import and no deps, so no pip install.
+        run: python scripts/ci/check_timezone_anchors.py

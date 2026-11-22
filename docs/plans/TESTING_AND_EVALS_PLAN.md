@@ -1,0 +1,317 @@
+# Testing and Evals — Plan
+
+**Date:** 2026-10-04 · **Status:** T1 and T2 merged (PRs #136, #137); T3 implemented (2026-10-04), awaiting PR.
+**Goal:** a real test suite that runs in CI and catches logic regressions, plus an eval
+harness that measures what the model *does* (tool choice, heartbeat decisions, safety rails),
+which nothing measures today.
+
+---
+
+## Slices
+
+- [x] **T1 — pytest foundation.** Move the `scripts/test_*.py` harnesses into a top-level
+      `tests/` package as native pytest, share their fakes, and add a required `tests` CI job.
+- [x] **T2 — Snapshot what the model sees.** Golden files for the system prompt per scope and
+      for the scoped tool surface, so every prompt or docstring change is a reviewable diff.
+- [x] **T3 — Unit tests where bugs have been.** Heartbeat gate and parser, time boundaries,
+      memory sandbox, message trimming, registry scoping, fitness math.
+- [x] **T4 — Eval runner + heartbeat cases.** Top-level `evals/`: scenario cases run through
+      the real graph and real Gemini, graded on the trajectory; 12 heartbeat cases. Built as
+      the context redesign's S4a (2026-10-16); grading reads the scratch episode store and the
+      Outbox recorder rather than the thread, since S4 makes ticks stateless.
+- [ ] **T5 — User-scope evals + workflow.** Tool-choice and safety-rail cases, a local
+      case-drafting helper, and an eval step in the `code-review` skill.
+
+Each slice ships and is verified on its own. T1 comes first because every later slice puts its
+tests in `tests/`. T2 and T3 can be done in either order. T4 needs only T1.
+
+---
+
+## 1. Where things stand
+
+**CI (`.github/workflows/ci.yml`)** runs four guards: path isolation, channel-agnosticism,
+slash-command reply layout and timezone anchors. They enforce architecture rules. None of them
+tests behavior.
+
+**Harnesses (`scripts/test_*.py`)** are hand-run scripts, each with its own `check()` /
+`FAILS` helper. They are not in CI, by the policy in DEPLOY.md. All pass as of 2026-10-04:
+
+| Harness | Checks | Time | Notes |
+|---|---|---|---|
+| `test_triggers.py` | 121 | 31s | fake LLM, fake Outbox, real scheduler |
+| `test_turn_lifecycle.py` | 87 | 5s | fake LLM, fake Outbox/channel |
+| `test_travel.py` | 235 | 2s | tool functions directly |
+| `test_app_blocks.py` | 27 | <1s | fails unless `JARVIS_ROOT` is exported; the rest make their own |
+| `test_context_mirror.py` | 18 | 3s | |
+| `test_app_confirmation.py` | 8 | <1s | |
+| `test_webhooks.py` | — | — | posts to a live server: an ops tool, not a test |
+
+**The seams already exist.** A scratch `JARVIS_ROOT` isolates every state path (`config` binds
+them at import). `agent.llm` can be swapped for a scripted `FakeLLM`, and there are fakes for
+the Outbox and the channel. Both tracks build on these. No new seam in app code is planned.
+
+**Gaps.**
+- No coverage for `heartbeat_state` (only indirectly, through the triggers harness), the
+  memory sandbox, fitness, media, google_health, github, or registry scoping.
+- No behavioral coverage at all. `test_travel.py` says it outright: "Whether the model reaches
+  for the right tool with the right arguments is judged by hand, in chat." `AGENTS.md`,
+  `heartbeat.md`, `SKILL.md` bodies and tool docstrings control most of the behavior, and
+  nothing guards them.
+- Telemetry can't see behavioral failures. In prod, 12,779 of 12,784 tool calls are
+  `status: ok`, because tools return error strings rather than raise.
+  `tool_calls.jsonl` also records only `args_size`, not the arguments.
+
+**Where the bugs have been.** Of the 42 `fix` commits, the most-touched files are `agent.py`
+(8), `heartbeat.py` (5) plus `heartbeat_state.py` (2), travel (4) and `tools/core/memory.py`
+(3). Several more were day-boundary and timezone bugs. Nearly all are deterministic logic.
+
+---
+
+## 2. Decisions
+
+- **D1 — Tests live in `tests/`, evals in `evals/`, never in `scripts/`.** `scripts/` is for
+  operator and dev entry points. A test is not something you run by hand, and an eval is
+  neither a test nor an ops tool. `scripts/ci/` keeps the four guards: they are static scans
+  or app-boot checks that the pre-commit hook and `deploy.sh` call directly, not tests.
+  (`check_command_replies.py` is closest to a test, but it stays because CI and the guard docs
+  already treat it as a guard.)
+- **D2 — The test suite is a required CI gate.** This reverses the DEPLOY.md line "the
+  harnesses are deliberately not in CI". The suite needs no network and no secrets and takes
+  about 45s. It is not in the pre-commit hook, for the same reason `command-replies` isn't:
+  it boots the app.
+- **D3 — Evals are on demand, never a CI gate.** They call the real model and are
+  non-deterministic. You run them before merging a change to a prompt, a docstring, a
+  `SKILL.md` or the model. Results are pass *rates* compared against a committed baseline.
+- **D4 — One scratch root per test session.** `config` binds paths at import, so
+  `tests/conftest.py` sets `JARVIS_ROOT` (and a dummy `GOOGLE_API_KEY`) before any project
+  import. Isolation between tests comes from fixtures that reset state directories and
+  restore swapped module attributes, plus a distinct thread id per test. No subprocess per
+  file.
+- **D5 — Eval tools are default-deny.** In an eval run, every tool outside an explicit
+  local-safe allowlist is replaced by a recorder that returns the case's canned output. Local
+  tools (memory, triggers, heartbeat tasks, travel, the fitness DB reads) run for real against
+  the scratch root. Everything that reaches outside (media, github, google_health, web,
+  anything that talks to Arbox) is stubbed. This matters because staging's Arbox credentials
+  book real gym seats.
+- **D6 — Evals grade the trajectory, and use a judge only for fuzzy qualities.** Assertions
+  run on the tool calls in the scratch thread's `AIMessage.tool_calls` (which carry full args)
+  and on the heartbeat ack. An LLM judge (Gemini, the project's provider) is used only for
+  things like the tone of a notification. No external eval platform: OBSERVABILITY.md already
+  rules out external systems, and the existing fakes do most of the work.
+- **D7 — Committed cases contain no real personal data.** Cases are written or sanitized by
+  hand. The drafting helper (T5) reads prod logs locally and writes drafts to a gitignored
+  directory. The owner reviews each draft before it becomes a case.
+- **D8 — Evals take the API key from the environment, or else from staging's secrets.** If
+  `GOOGLE_API_KEY` is not set, the runner reads it (and nothing else) from
+  `/app/jarvis_staging/secrets/.env`, as `measure_context.py` does, so Claude Code can run evals
+  too (owner, 2026-10-16; this replaces "environment only"). Prod's `.env` is refused.
+
+---
+
+## 3. T1 — pytest foundation
+
+**Layout.**
+```
+tests/
+├── conftest.py            # scratch JARVIS_ROOT + dummy key before imports; shared fixtures
+├── fakes.py               # FakeLLM, FakeOutbox, FakeChannel (deduped from the harnesses)
+├── test_triggers.py
+├── test_turn_lifecycle.py
+├── test_context_mirror.py
+├── tools/test_travel.py
+└── channels/jarvis_app/   # channel-internal tests; exempt from the channel-agnostic guard
+    ├── test_blocks.py
+    └── test_confirmation.py
+pytest.ini                 # testpaths = tests
+requirements-dev.txt       # -r requirements.txt, pytest, pytest-asyncio, hypothesis
+```
+`requirements-dev.txt` keeps test deps out of prod, so `deploy.sh`'s pip step is unchanged.
+
+**Checklist.**
+- [x] `requirements-dev.txt`, `pytest.ini`, `tests/conftest.py` (root + key before imports,
+      with an assert that `config.ROOT` is the scratch root, as the harnesses did). An autouse
+      fixture empties the activity logs and the mirror cursor before each test.
+- [x] `tests/fakes.py`: one `FakeLLM` (scripted replies or exceptions, records requests,
+      exposes the bound tools), `FakeOutbox`, `FakeChannel`. Fixtures install them and
+      restore the originals afterwards (`agent.llm`, the factory's outbox, `heartbeat.TURN_LOCK`).
+      Also `gateway_state`, which snapshots the factory's registries and the Outbox's loop.
+- [x] Convert each harness with `git mv` and then edit, so history follows the file. Each
+      numbered section becomes a test function. Sections that depend on earlier state share a
+      module-scoped fixture or are merged into one test; nothing is reordered silently.
+      - [x] `test_triggers` · [x] `test_turn_lifecycle` · [x] `test_context_mirror`
+      - [x] `test_travel` · [x] `test_app_blocks` · [x] `test_app_confirmation`
+
+      The triggers tests each get their own event loop and started scheduler (`pytest-asyncio`,
+      added to the dev requirements). The travel tests stay one cumulative scenario in file
+      order (shared database); their definitions were reordered to match the old run order.
+- [x] **Parity check per file** — `check()` call sites before → assertions after:
+      triggers 121 → 121 · turn lifecycle 87 → 87 · context mirror 18 → 18 · travel 234 → 234
+      (substring helper kept, now asserting) · app blocks 32 checks + 12 `raises` → 32 + 12 ·
+      app confirmation 8 → 8. Checks the harnesses guarded with `if` (e.g. "if a notice was
+      sent, check its text") are now unconditional. 103 tests, about 35s, green in either
+      module order; no file under the real staging or prod roots changed during a run.
+- [x] `scripts/test_webhooks.py` → `scripts/fire_webhooks.py` (it fires at a live server;
+      the `test_` prefix was misleading).
+- [x] Guards: `check_channel_agnostic.py` swaps its two named `scripts/test_app_*.py`
+      exemptions for the `tests/channels/` tree. `check_timezone_anchors.py` skips `tests/`
+      and `evals/` (fixtures seed Israel-dated data), as it skips `scripts/` today. (Only
+      `tests/` for now; `evals/` is added with T4.)
+- [x] CI: a `tests` job (`pip install -r requirements-dev.txt`, `pytest -q`).
+- [ ] **Owner step:** add `tests` to the branch-protection required checks on `main`.
+- [x] Docs: the DEPLOY.md regression-gate section (D2), the CLAUDE.md layout (`tests/`;
+      `evals/` is added with T4), the harness reference in `docs/architecture/TRIGGERS.md`,
+      and DEVELOPMENT.md (how to run the suite).
+- [ ] Verify: `pytest` is green locally and in CI. A deliberately broken assertion turns the
+      `tests` job red on a throwaway PR.
+
+---
+
+## 4. T2 — Snapshot what the model sees
+
+The prompt and the tool schemas *are* the behavior surface. A golden file makes any change to
+them visible in review, including accidental ones such as a tool silently becoming always-on.
+
+Every memory file Jarvis writes (SOUL.md, USER.md, HEARTBEAT.md, daily logs, the chat log) is
+a committed fixture, never the real file, so the golden files move only when code or the
+committed prompts change. Drift from Jarvis's own writes is runtime state; telemetry
+(`turns.jsonl` input tokens) is where that shows.
+
+- [x] `tests/fixtures/`: fixture SOUL.md, USER.md, today's and yesterday's daily logs, a
+      chat log (rows from yesterday and from the heartbeat thread, which must be dropped), and
+      a HEARTBEAT.md with a due, a not-due, a gated and a paused task, so the due-filtering is
+      covered too.
+- [x] `tests/test_prompt_snapshot.py`: `build_system_prompt` for `user` and for `heartbeat`
+      (one due task), against the fixtures with agent.py's clock pinned; plus the skill block
+      with every skill active, which covers every `SKILL.md` body. Three golden files instead
+      of one per scope × skill: the per-skill prompts would differ only in that block.
+- [x] `tests/test_tool_surface.py`: one golden file per namespace, `tests/golden/tools/<ns>.json`
+      (name, destructive flag, scopes, and the schema from the docstring and arguments), one
+      parametrized test each; plus `tests/golden/surface.md`: the always-on tools and the
+      count and estimated tokens (characters ÷ 4) per scope and active skill. The schema is
+      langchain's neutral form (`convert_to_openai_tool`); Gemini's own conversion is private.
+- [x] `pytest --update-golden` (a conftest option) rewrites the golden files. A mismatch
+      fails with a unified diff; a missing golden file fails rather than being created.
+- [x] Verify: a one-word edit to `fetch_url`'s docstring failed `test_tool_schemas[web]` with
+      a readable diff, and `surface.md` with it (the token estimate moved). Reverted, green.
+      The golden files are identical under other system timezones and contain no scratch paths.
+
+---
+
+## 5. T3 — Unit tests where bugs have been
+
+Ordered by bug history. `hypothesis` is used where the input space is a clock.
+
+176 tests across six files, about 3s. Each file was checked against a past fix: the fix was
+undone in place, the file had to fail, and the fix was restored (nothing committed).
+
+- [x] `tests/test_heartbeat_state.py` (49): `due:` windows (ranges, midnight wrap, `±Nh` and its
+      ASCII spellings, weekdays, malformed specs), header parsing (cadence units, `paused` and
+      `gate:` only as their own fields, duplicates), `any_due` cases (grace, the lattice rescue
+      and its one-tick exception, unreadable and naive stamps, empty or missing file), property
+      tests over arbitrary stamp/now pairs, and stamping through the real store.
+      Catches `cd63ef6`: without the lattice rescue, or with it extended to hourly tasks.
+- [x] `tests/test_time_boundaries.py` (24): Sunday-anchored weeks across both 2026 DST
+      switches (plus a property test), `get_chat_history`'s `since` in winter and summer, the
+      rolling 24h mirror window, `/tz` set/clear/unreadable, google_health days following the
+      owner, the turn stamp home and away, and home-anchored surfaces ignoring away mode.
+      Catches `422bb53` (a fixed +03:00 day start fails the winter case) and `b2e99ec` (an
+      Israel-day floor drops last night's send).
+- [x] `tests/tools/test_memory_sandbox.py` (39): `_get_safe_path` (traversal, absolute paths,
+      symlinks out of and inside the tree, the checkpointer deny-list), alias spellings, and
+      the tools: HEARTBEAT.md never written directly, SOUL.md only after confirmation (a fake
+      confirmation; the write happens when it is confirmed), protected files never deleted,
+      deletes wait for confirmation, `list_memory` shows only memory files.
+      Catches `6702b7a` (`abspath` for `realpath` lets the symlink out) and `b1a1980`
+      (without canonical names every alias spelling bypasses the guards).
+- [x] `tests/test_agent_messages.py` (25): mime normalization, every alias landing on a
+      supported mime, stripping seen media while keeping the new turn's, `_merge_skills`.
+      `_add_and_trim`'s trimming stays with the lifecycle and mirror tests.
+- [x] `tests/test_registry.py` (31): on a private fake registry — re-registration rules,
+      binding by scope and activation (a parent binds none of its children), `find`, the
+      skill block (children hidden until the parent is active, an active child's rules shown
+      without it), frontmatter parsing; on the real one — every skill has a description and
+      every tool a docstring. Narrower than drafted: T2's `surface.md` already pins what binds.
+- [x] `tests/tools/test_fitness_adherence.py` (8): on the real schema in a temp DB — an unmet
+      current week is pending, targets judged as of each week's start, the walk stops at the
+      plan start and at a miss, what counts toward a week, inclusive week edges.
+      Catches `7c32116` (walking from the current week breaks 4 of 8).
+- [x] No real bug found. One drafted case was wrong rather than the code: `_article("")`
+      returns "an", but its callers only ever pass a known media kind, so the case was dropped.
+
+---
+
+## 6. T4 — Eval runner + heartbeat cases
+
+**Layout.**
+```
+evals/
+├── run.py                 # python -m evals.run [--case GLOB] [-k 3] [--update-baseline]
+├── harness.py             # scratch root, case seeding, tool stubbing (D5), pinned clock
+├── grade.py               # trajectory/ack assertions; optional judge
+├── cases/heartbeat/*.yaml
+├── baseline.json          # committed pass rates per case
+└── results/               # gitignored: one JSONL per run
+```
+
+**A case** (YAML):
+- `scope`, a pinned `now`, and seeded files (memory files, today's chat and notification log
+  rows, HEARTBEAT.md and its `last_run` stamps)
+- prior thread messages, and the input (a user message, or a tick)
+- `stubs`: canned outputs for stubbed tools, by name
+- `expect`: assertions such as `called: {tool, args_match}`, `not_called`,
+  `ack: {notify, acted_tasks}`, `judge: "<rubric>"` (optional)
+
+**One run** builds a fresh scratch root, seeds it, swaps the stubbed tools in the registry,
+runs the turn through the real graph (`ask_jarvis` or `heartbeat.run_heartbeat` with a fake
+Outbox), then grades from the thread state and the ack. Each case runs k times (default 3).
+The report gives per-case pass rates, the delta against `baseline.json`, and tokens used,
+read from the scratch `turns.jsonl`.
+
+**Checklist.**
+- [ ] `harness.py`, `grade.py`, `run.py` as above. The runner refuses to start without
+      `GOOGLE_API_KEY` in the environment (D8). The default-deny allowlist lives in
+      `harness.py`.
+- [ ] About 10 heartbeat cases, for example:
+      - nothing worth sending, so `notify=False`
+      - a due task with a real finding, so `notify=True` and the task is in `acted_tasks`
+      - a task the owner already handled in today's chat is skipped
+      - two due tasks, one acted on: only that one is in `acted_tasks`
+      - a heartbeat turn may not `create` a heartbeat task
+      - a task-linked wake sees its task's block and acts on it
+      - a quiet wake makes no tool calls besides the ack
+- [ ] First baseline committed with the model in use recorded in it.
+- [ ] Verify: a full run is reproducible enough to compare (each case's pass rate across two
+      runs of k=3 differs by at most one run). A deliberately weakened rule in `heartbeat.md`
+      lowers at least one case's pass rate.
+
+---
+
+## 7. T5 — User-scope evals + workflow
+
+- [ ] `evals/cases/user/*.yaml`, about 15 cases:
+      - tool and skill choice: travel, fitness, triggers ("remind me…", "check X in 10
+        minutes"), memory lookup through the MEMORY.md index
+      - argument correctness: trigger time from a relative phrase under a pinned clock
+      - safety rails: a SOUL.md edit goes through confirmation; a destructive media delete
+        asks before acting; no booking on an ambiguous request
+      - reply-to-proactive: a reply to a mirrored heartbeat notification resolves its
+        antecedent
+- [ ] `evals/draft_case.py`: given a turn id, reads prod `chat_history.jsonl` / `turns.jsonl`
+      locally and writes a case skeleton to the gitignored `evals/drafts/` for hand sanitizing
+      (D7).
+- [ ] `code-review` skill: when a diff touches `prompts/`, any `SKILL.md`, a tool docstring
+      or the model id, the review asks for an eval run and the delta against the baseline.
+- [ ] DEVELOPMENT.md: how to run evals, how to read the report, and when to update the
+      baseline.
+- [ ] Verify: the full suite runs end to end, and one known past behavioral miss, written as
+      a case, fails against an older prompt and passes against the current one.
+
+---
+
+## 8. Out of scope
+
+- Mocking the external services (Sonarr, Radarr, Jellyseerr, Arbox, Google, GitHub) for unit
+  tests. Fixtures get recorded only for a parser that has actually broken.
+- Coverage targets. The suite grows where bugs and changes happen.
+- Running evals in CI or on a schedule.
+- Changing telemetry to record tool arguments. Evals read them from the thread state instead.

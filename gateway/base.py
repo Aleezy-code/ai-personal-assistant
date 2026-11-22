@@ -1,0 +1,143 @@
+"""
+Gateway boundary contracts — the neutral types and ABCs that decouple Jarvis's
+domain logic from any specific messaging system.
+
+See docs/architecture/GATEWAY.md for the full design. This module is the single
+source of truth for the Channel / Confirmation contracts. Channels live under
+gateway/<channel>/ and implement these; tools, agent, and heartbeat code import
+only from here (or from the channel-agnostic accessors), never from a concrete
+channel module.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Awaitable, Callable
+
+# The one conversation. Every channel stamps this on the owner's inbound
+# messages and shares the LangGraph thread behind it; a channel is a surface
+# onto the conversation, not a conversation of its own. The turn's origin
+# channel travels separately (InboundMessage.channel -> CURRENT_CHANNEL).
+OWNER_THREAD_ID = "owner"
+
+# How long a channel lets one media upload take: a base plus time per MB, so a
+# large video isn't cut off by a limit sized for messages. A caller waiting on a
+# media send waits longer than this (media_send_wait_s).
+_UPLOAD_BASE_S = 10.0
+_UPLOAD_S_PER_MB = 4.0
+
+
+def media_upload_timeout_s(n_bytes: int) -> float:
+    return _UPLOAD_BASE_S + _UPLOAD_S_PER_MB * n_bytes / (1024 * 1024)
+
+
+def media_send_wait_s(n_bytes: int) -> float:
+    """Upload limit plus room for the message that carries it."""
+    return media_upload_timeout_s(n_bytes) + 30.0
+
+
+@dataclass
+class InboundMessage:
+    """Channel-agnostic message shape delivered by a channel to the app domain.
+
+    `thread_id` namespaces per-conversation state (LangGraph checkpointer key +
+    chat_history.jsonl tag). All owner traffic carries OWNER_THREAD_ID.
+    """
+
+    user_id: int
+    chat_id: int
+    thread_id: str
+    user_text: str
+    # Channel.name of the producer — the turn's origin marker for routing.
+    channel: str = ""
+    # Each: {kind, mime_type, data, filename, source, origin_id}. `data` is the
+    # file's bytes; channels never store files — core saves each one in the file
+    # store before the turn and the turn sees file ids. `kind` and `mime_type`
+    # are the channel's hints (the store classifies from the content);
+    # `filename` may be None; `source` is the channel's name; `origin_id` is the
+    # channel's own id for the file.
+    attachments: list[dict] = field(default_factory=list)
+
+
+# Inbound handler contract: a channel produces an InboundMessage and awaits this
+# handler, which returns the reply text the channel posts back (Plane 1 -> Plane 2).
+OnMessage = Callable[[InboundMessage], Awaitable[str | None]]
+
+
+class Channel(ABC):
+    """Boundary between Jarvis's domain logic and one external messaging system.
+
+    A channel is a thin adapter: it translates between an external protocol and
+    the neutral contracts here. Anything richer belongs elsewhere (agent.py,
+    memory tools, heartbeat).
+    """
+
+    name: str  # "telegram", "email", "whatsapp", "webhook", ...
+
+    @abstractmethod
+    async def send(self, chat_id: str, text: str, *, reply_to: str | None = None) -> None:
+        """Reply to a known chat (Plane 2, reply path)."""
+
+    @abstractmethod
+    async def send_media(
+        self, chat_id: str, kind: str, payload: bytes, caption: str | None = None,
+        *, filename: str | None = None, mime_type: str | None = None,
+    ) -> None:
+        """Reply with media to a known chat. `kind` is image, audio, video,
+        document or file; `filename` and `mime_type` are hints a channel may use
+        (a document's name). Channels that can't represent `kind` raise
+        NotImplementedError; the caller downgrades or skips."""
+
+    @abstractmethod
+    async def send_to_owner(self, text: str, *, event: str | None = None) -> None:
+        """Proactive send to the channel's owner (Plane 2, proactive path).
+
+        The decoupling seam for heartbeat / confirmation outcomes: callers have no
+        chat_id. The channel reads its own owner-config env at construction and
+        addresses internally.
+
+        `event` is the Outbox's event tag (an outbox.EVENT_* value, None when
+        untagged). A channel with somewhere to show where a message came from
+        maps it onto its wire; any other channel ignores it."""
+
+    @abstractmethod
+    async def send_to_owner_media(
+        self, kind: str, payload: bytes, caption: str | None = None,
+        *, event: str | None = None, filename: str | None = None, mime_type: str | None = None,
+    ) -> None:
+        """Media send to the channel's owner (posters, a stored file sent back).
+        `event` as in send_to_owner; `kind`, `filename`, `mime_type` as in send_media."""
+
+    @abstractmethod
+    def authorize(self, raw_user_id: str) -> bool:
+        """Is this user allowed to use Jarvis on this channel?"""
+
+    @property
+    @abstractmethod
+    def owner_thread_id(self) -> str:
+        """Canonical agent thread id for the owner's conversation on this
+        channel (same value the channel's router stamps on inbound messages).
+        Lets domain code address the owner's thread without knowing the
+        channel's thread_id format."""
+
+    async def send_stream(self, chat_id: str, chunks: AsyncIterator[str]) -> None:
+        """Default: collect chunks, then send once. Streaming channels override."""
+        full = "".join([c async for c in chunks])
+        await self.send(chat_id, full)
+
+    # ------------------------------------------------------------------
+    # Interactive blocks (gateway/blocks/) — optional per channel, and
+    # deliberately kind-generic: a new block kind never edits this ABC.
+    # ------------------------------------------------------------------
+
+    def supports_block(self, kind: str) -> bool:
+        """Whether this channel can render block `kind`. The pre-flight callers
+        consult *before* composing — so "this channel has no forms" is decided
+        here, and a send that still fails is an ordinary transient failure."""
+        return False
+
+    async def send_block(self, text: str, block, *, event: str | None = None) -> None:
+        """Send `text` to the owner with `block` (a gateway.blocks.Block)
+        attached. All-or-nothing: a channel must never deliver the text without
+        the block, or the owner gets a dangling opener pointing at a card that
+        isn't there. `event` as in send_to_owner."""
+        raise NotImplementedError(f"{self.name} does not render blocks")

@@ -1,0 +1,223 @@
+"""
+JarvisAppChannel — the jarvis-app implementation of the Channel contract.
+
+A thin adapter over HubClient. The hub is one-bot-one-owner: there is a single
+conversation, so `chat_id` carries no routing and every send addresses the owner.
+Media rides the attachment model: upload the bytes, then send a message that
+references the returned id. The hub's kinds are image | audio | file; a kind this
+channel can't represent raises NotImplementedError, which the Outbox reports as a
+failed send (base.Channel.send_media contract) rather than mislabeling the blob.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+from io import BytesIO
+
+try:
+    from PIL import Image
+except ImportError:
+    # Pillow only powers optional upload metadata (dimensions + blur-up
+    # placeholder). The factory imports this module unconditionally, so a deploy
+    # without Pillow must still import cleanly — metadata just degrades to none.
+    Image = None
+
+from gateway.base import Channel, OWNER_THREAD_ID
+from gateway.blocks import Form
+from gateway.channels.jarvis_app import media_meta
+from gateway.channels.jarvis_app.client import HubClient
+from gateway.outbox import EVENT_HEARTBEAT, EVENT_LLM_MEDIA, EVENT_MEDIA, EVENT_REMINDER
+
+logger = logging.getLogger(__name__)
+
+# Outbox event tag -> the hub's `meta.source`. The hub accepts a closed set and
+# refuses anything else, so an event missing here sends no meta at all (the hub
+# then records "agent") rather than a value that would fail the send.
+_EVENT_SOURCE = {
+    EVENT_HEARTBEAT: "heartbeat",
+    EVENT_REMINDER: "reminder",
+    EVENT_MEDIA: "notifier",
+    EVENT_LLM_MEDIA: "notifier",
+}
+
+
+def _with_source(body: dict, event: str | None) -> dict:
+    source = _EVENT_SOURCE.get(event)
+    if source is not None:
+        body["meta"] = {"source": source}
+    return body
+
+
+# Longest edge of the blur-up placeholder thumbnail, matching the app's own
+# outbound encoder (AttachmentBlurEncoder): ~24px, JPEG quality 60.
+_BLUR_EDGE = 24
+_BLUR_QUALITY = 60
+
+
+# The kinds this channel can represent, mapped to the (filename, mime_type) the
+# upload needs. The hub infers its Attachment.kind from the mime type, and its own
+# enum is image | audio | file — Telegram's "video" has no equivalent here, so it
+# (and any other kind) falls through to NotImplementedError rather than being
+# mislabeled. Images sniff PNG vs JPEG since posters arrive as either.
+def _upload_metadata(kind: str, mime_type: str, payload: bytes) -> dict:
+    """What the app shows before it downloads: an image's size and blur-up
+    placeholder, a voice note's length, a video's length and size."""
+    if kind == "image":
+        return _image_metadata(payload)
+    if mime_type.startswith("audio/"):
+        return media_meta.audio_metadata(payload)
+    if mime_type.startswith("video/"):
+        return media_meta.video_metadata(payload)
+    return {}
+
+
+def _upload_meta(kind: str, payload: bytes, filename: str | None = None,
+                 mime_type: str | None = None) -> tuple[str, str]:
+    """Upload name and mime. The hub infers its kind (image, audio or file) from
+    the mime, so any other kind goes up as a file under its own name."""
+    if kind == "image":
+        if mime_type and mime_type.startswith("image/"):
+            return filename or "image." + mime_type.split("/")[1], mime_type
+        if payload[:8] == b"\x89PNG\r\n\x1a\n":
+            return filename or "image.png", "image/png"
+        return filename or "image.jpg", "image/jpeg"
+    if kind == "audio":
+        if mime_type and mime_type.startswith("audio/"):
+            return filename or "audio." + mime_type.split("/")[1], mime_type
+        return filename or "audio.ogg", "audio/ogg"
+    return filename or "file", mime_type or "application/octet-stream"
+
+
+# Pixel dimensions + a tiny base64 blur-up thumbnail for an image, so the app
+# reserves the right aspect ratio (no thread reflow) and shows a placeholder
+# while the full image loads. Best-effort: any decode/encode failure returns
+# empty metadata and the upload proceeds without it (the hub treats every field
+# as optional and the app degrades to a plain placeholder). blur_preview is not a
+# perceptual hash — it is base64 of a real ~24px thumbnail the app just decodes.
+def _image_metadata(payload: bytes) -> dict:
+    if Image is None:
+        return {}
+    try:
+        with Image.open(BytesIO(payload)) as im:
+            im.load()
+            width, height = im.size
+            thumb = im.copy()
+            thumb.thumbnail((_BLUR_EDGE, _BLUR_EDGE))
+            # JPEG has no alpha/palette — normalize so the thumbnail always saves.
+            if thumb.mode not in ("RGB", "L"):
+                thumb = thumb.convert("RGB")
+            buf = BytesIO()
+            thumb.save(buf, "JPEG", quality=_BLUR_QUALITY)
+        blur = base64.b64encode(buf.getvalue()).decode("ascii")
+        return {"width": width, "height": height, "blur_preview": blur}
+    except Exception as exc:
+        logger.warning("jarvis-app image metadata skipped: %s", exc)
+        return {}
+
+
+# Neutral block -> hub wire payload. One entry per kind this channel renders;
+# the mapping lives here (not as a to_wire() on the neutral model) because the
+# JSON is this hub's vocabulary, and a second channel rendering the same block
+# would need a different one.
+def _form_wire(form: Form) -> dict:
+    payload: dict = {
+        "callback_id": form.callback_id,
+        "title": form.title,
+        "rows": [
+            {
+                "label": row.label,
+                "fields": [
+                    {
+                        "field_id": f.field_id,
+                        "type": f.type,
+                        **({"unit": f.unit} if f.unit is not None else {}),
+                        **({"default": f.default} if f.default is not None else {}),
+                    }
+                    for f in row.fields
+                ],
+            }
+            for row in form.rows
+        ],
+    }
+    if form.subtitle:
+        payload["subtitle"] = form.subtitle
+    if form.submit_label:
+        payload["submit_label"] = form.submit_label
+    return {"kind": form.kind, "summary": form.summary, "payload": payload}
+
+
+_BLOCK_WIRE = {Form: _form_wire}
+
+
+class JarvisAppChannel(Channel):
+    name = "jarvis-app"
+
+    def __init__(self, client: HubClient, owner_id: str) -> None:
+        self._client = client
+        self._owner_id = owner_id
+
+    # ------------------------------------------------------------------
+    # Channel ABC
+    # ------------------------------------------------------------------
+
+    async def send(self, chat_id: str, text: str, *, reply_to: str | None = None) -> None:
+        # One owner, one conversation — chat_id is not a routing key here.
+        await self._client.send_message({"text": text})
+
+    async def send_media(
+        self, chat_id: str, kind: str, payload: bytes, caption: str | None = None,
+        *, filename: str | None = None, mime_type: str | None = None,
+    ) -> None:
+        # One owner, one conversation — chat_id is not a routing key here.
+        await self._upload_and_send(kind, payload, caption, None, filename, mime_type)
+
+    async def send_to_owner(self, text: str, *, event: str | None = None) -> None:
+        await self._client.send_message(_with_source({"text": text}, event))
+
+    async def send_to_owner_media(
+        self, kind: str, payload: bytes, caption: str | None = None,
+        *, event: str | None = None, filename: str | None = None, mime_type: str | None = None,
+    ) -> None:
+        await self._upload_and_send(kind, payload, caption, event, filename, mime_type)
+
+    async def _upload_and_send(
+        self, kind: str, payload: bytes, caption: str | None, event: str | None = None,
+        filename: str | None = None, mime_type: str | None = None,
+    ) -> None:
+        filename, mime_type = _upload_meta(kind, payload, filename, mime_type)
+        # A full-size photo's decode takes long enough to stall the shared loop.
+        meta = await asyncio.to_thread(_upload_metadata, kind, mime_type, payload)
+        att_id = await self._client.upload_attachment(
+            payload, filename=filename, mime_type=mime_type, **meta
+        )
+        body: dict = {"attachment_ids": [att_id]}
+        if caption:
+            body["text"] = caption
+        await self._client.send_message(_with_source(body, event))
+
+    def supports_block(self, kind: str) -> bool:
+        return any(cls.kind == kind for cls in _BLOCK_WIRE)
+
+    async def send_block(self, text: str, block, *, event: str | None = None) -> None:
+        # One POST carries text and block together, so the all-or-nothing
+        # contract holds without any compensation logic.
+        to_wire = _BLOCK_WIRE.get(type(block))
+        if to_wire is None:
+            raise NotImplementedError(
+                f"jarvis-app cannot render block kind={getattr(block, 'kind', '?')!r}"
+            )
+        await self._client.send_message(
+            _with_source({"text": text, "blocks": [to_wire(block)]}, event)
+        )
+
+    def authorize(self, raw_user_id: str) -> bool:
+        # The bot token scopes the hub to the single owner, so inbound updates are
+        # already authorized upstream; this checks against the configured owner
+        # for completeness.
+        return str(raw_user_id) == self._owner_id
+
+    @property
+    def owner_thread_id(self) -> str:
+        return OWNER_THREAD_ID
