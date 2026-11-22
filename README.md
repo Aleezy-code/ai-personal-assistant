@@ -28,8 +28,6 @@ Designed to simplify everyday tasks, JARVIS provides a foundation for building a
 
 ## 🛠️ Technology Stack
 
-Update this section according to the technologies actually used in the project.
-
 - **Programming Language:** Python
 - **AI / LLM:** Google Gemini API (google-genai)
 - **Framework:** LangChain, LangGraph
